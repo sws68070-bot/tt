@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
-<title>DEPTH // cubo por movimento</title>
+<title>DEPTH // cubo ancorado</title>
 <style>
   @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Inter:wght@400;500;600;700&display=swap');
 
@@ -30,14 +30,11 @@
 
   #scene{
     position:fixed; inset:0; width:100%; height:100%; z-index:1;
-    pointer-events:none;
   }
 
-  /* vignette to seat the HUD into the camera feed */
   #vignette{
     position:fixed; inset:0; z-index:2; pointer-events:none;
-    background:
-      radial-gradient(120% 90% at 50% 50%, transparent 45%, rgba(0,0,0,0.55) 100%);
+    background: radial-gradient(120% 90% at 50% 50%, transparent 45%, rgba(0,0,0,0.55) 100%);
   }
 
   .scanlines{
@@ -46,36 +43,25 @@
     mix-blend-mode:overlay;
   }
 
-  /* ---- HUD ---- */
-  .hud{ position:fixed; z-index:5; }
+  .hud{ position:fixed; z-index:5; pointer-events:none; }
 
-  .corner{
-    position:fixed; width:22px; height:22px; border-color:var(--signal-dim); z-index:5;
-    opacity:0.9;
-  }
+  .corner{ position:fixed; width:22px; height:22px; border-color:var(--signal-dim); z-index:5; opacity:0.9; pointer-events:none;}
   .corner.tl{ top:16px; left:16px; border-top:2px solid var(--signal); border-left:2px solid var(--signal); }
   .corner.tr{ top:16px; right:16px; border-top:2px solid var(--signal); border-right:2px solid var(--signal); }
   .corner.bl{ bottom:16px; left:16px; border-bottom:2px solid var(--signal); border-left:2px solid var(--signal); }
   .corner.br{ bottom:16px; right:16px; border-bottom:2px solid var(--signal); border-right:2px solid var(--signal); }
 
-  .brand{
-    top:20px; left:44px; font-family:'IBM Plex Mono', monospace;
-    font-size:12px; letter-spacing:0.18em; color:var(--text-dim); text-transform:uppercase;
-  }
+  .brand{ top:20px; left:44px; font-family:'IBM Plex Mono', monospace; font-size:12px; letter-spacing:0.18em; color:var(--text-dim); text-transform:uppercase; }
   .brand b{ color:var(--signal); font-weight:600; }
 
-  .clock{
-    top:20px; right:44px; font-family:'IBM Plex Mono', monospace;
-    font-size:12px; letter-spacing:0.1em; color:var(--text-dim);
-    text-align:right;
-  }
+  .clock{ top:20px; right:44px; font-family:'IBM Plex Mono', monospace; font-size:12px; letter-spacing:0.1em; color:var(--text-dim); text-align:right; }
 
   .readout{
     bottom:52px; left:44px; font-family:'IBM Plex Mono', monospace;
     display:flex; flex-direction:column; gap:10px;
     background:var(--glass); backdrop-filter: blur(10px);
     border:1px solid var(--line); border-radius:4px;
-    padding:14px 18px; min-width:190px;
+    padding:14px 18px; min-width:200px;
   }
   .readout .row{ display:flex; justify-content:space-between; gap:18px; font-size:12px; }
   .readout .label{ color:var(--text-dim); letter-spacing:0.08em; }
@@ -85,54 +71,50 @@
   .bar-wrap{ width:100%; height:3px; background:rgba(255,255,255,0.12); border-radius:2px; margin-top:2px; overflow:hidden;}
   .bar{ height:100%; width:0%; background:var(--signal); transition:width 0.15s linear; }
 
-  .caption{
-    bottom:52px; right:44px; max-width:220px; text-align:right;
-    font-size:12px; line-height:1.5; color:var(--text-dim);
-  }
+  .caption{ bottom:52px; right:44px; max-width:220px; text-align:right; font-size:12px; line-height:1.5; color:var(--text-dim); }
   .caption b{ color:var(--text); font-weight:600; }
 
-  /* start overlay */
+  #placeBtn{
+    position:fixed; z-index:6; bottom:150px; left:50%; transform:translateX(-50%);
+    appearance:none; border:1px solid var(--signal); background:var(--signal-dim);
+    color:var(--text); font-family:'Inter',sans-serif; font-weight:600; font-size:13px;
+    padding:11px 22px; border-radius:999px; cursor:pointer; letter-spacing:0.02em;
+  }
+  #placeBtn:active{ transform:translateX(-50%) scale(0.96); }
+
   #gate{
     position:fixed; inset:0; z-index:10; display:flex; align-items:center; justify-content:center;
     background:radial-gradient(120% 120% at 50% 20%, #10151b 0%, #05070a 70%);
     padding:24px;
   }
   #gate .panel{
-    max-width:420px; width:100%; text-align:center;
+    max-width:430px; width:100%; text-align:center;
     border:1px solid var(--line); border-radius:6px; padding:36px 28px;
     background:var(--glass); backdrop-filter: blur(6px);
   }
-  #gate .eyebrow{
-    font-family:'IBM Plex Mono', monospace; font-size:11px; letter-spacing:0.22em;
-    color:var(--signal); text-transform:uppercase; margin-bottom:14px;
-  }
-  #gate h1{
-    font-size:26px; line-height:1.25; margin:0 0 12px; font-weight:700; letter-spacing:-0.01em;
-  }
+  #gate .eyebrow{ font-family:'IBM Plex Mono', monospace; font-size:11px; letter-spacing:0.22em; color:var(--signal); text-transform:uppercase; margin-bottom:14px; }
+  #gate h1{ font-size:25px; line-height:1.25; margin:0 0 12px; font-weight:700; letter-spacing:-0.01em; }
   #gate p{ font-size:14px; color:var(--text-dim); line-height:1.6; margin:0 0 26px; }
   #gate button{
     appearance:none; border:1px solid var(--signal); background:var(--signal-dim);
     color:var(--text); font-family:'Inter',sans-serif; font-weight:600; font-size:14px;
     padding:13px 26px; border-radius:4px; cursor:pointer; letter-spacing:0.02em;
-    transition:background 0.15s, transform 0.1s;
-    width:100%;
+    transition:background 0.15s, transform 0.1s; width:100%;
   }
   #gate button:active{ transform:scale(0.98); }
   #gate button:hover{ background:rgba(255,176,32,0.5); }
   #gate .fine{ margin-top:16px; font-size:11px; color:var(--text-dim); font-family:'IBM Plex Mono',monospace; }
-  #gate .err{ margin-top:14px; font-size:12px; color:#ff6b6b; display:none; }
+  #gate .err{ margin-top:14px; font-size:12px; color:#ff6b6b; display:none; text-align:left; }
 
   @media (max-width:520px){
     .brand{ left:38px; }
     .clock{ right:38px; }
-    .readout{ left:16px; right:16px; bottom:100px; min-width:0; }
+    .readout{ left:16px; right:16px; bottom:150px; min-width:0; }
     .caption{ display:none; }
-    .corner.tl,.corner.tr{ top:12px; }
+    #placeBtn{ bottom:250px; }
   }
 
-  @media (prefers-reduced-motion: reduce){
-    .bar{ transition:none; }
-  }
+  @media (prefers-reduced-motion: reduce){ .bar{ transition:none; } }
 </style>
 </head>
 <body>
@@ -147,30 +129,32 @@
 <div class="corner bl"></div>
 <div class="corner br"></div>
 
-<div class="hud brand">DEPTH <b>// cubo v1</b></div>
+<div class="hud brand">DEPTH <b>// cubo v2</b></div>
 <div class="hud clock" id="clock">--:--:--</div>
 
 <div class="hud readout">
   <div class="row"><span class="label">PASSOS</span><span class="val" id="steps">0</span></div>
-  <div class="row"><span class="label">DISTÂNCIA (Z)</span><span class="val" id="dist">0.0 m</span></div>
-  <div class="row"><span class="label">INCLINAÇÃO</span><span class="val ok" id="tilt">0° / 0°</span></div>
+  <div class="row"><span class="label">DISTÂNCIA DO CUBO</span><span class="val" id="dist">0.0 m</span></div>
+  <div class="row"><span class="label">RUMO</span><span class="val ok" id="tilt">0°</span></div>
   <div class="bar-wrap"><div class="bar" id="bar"></div></div>
 </div>
 
 <div class="hud caption">
-  <b>Ande</b> para afastar o cubo.<br>
-  <b>Fique parado</b> e ele volta a se aproximar.<br>
-  Incline o telefone para orbitar.
+  O cubo fica <b>fixo no espaço</b>, onde você o colocar.<br>
+  Ande e ele fica para trás — <b>você se afasta dele</b>, não o contrário.<br>
+  Vire o celular para olhar em outra direção.
 </div>
+
+<button id="placeBtn">Colocar cubo aqui na sua frente</button>
 
 <div id="gate">
   <div class="panel">
     <div class="eyebrow">Sensor + Câmera</div>
-    <h1>Um cubo que reage aos seus passos</h1>
-    <p>Este site usa a câmera como fundo e dois sensores de movimento — acelerômetro e giroscópio — para posicionar um cubo em 3D. Ande com o celular e o cubo se afasta; fique parado e ele volta.</p>
+    <h1>Um cubo que fica parado no mundo real</h1>
+    <p>A câmera vira o fundo, e dois sensores — acelerômetro (seus passos) e giroscópio/bússola (para onde você aponta o celular) — ancoram um cubo num ponto fixo à sua frente. Ande e ele fica para trás, como se estivesse mesmo ali.</p>
     <button id="startBtn">Ativar câmera e sensores</button>
     <div class="err" id="err"></div>
-    <div class="fine">Funciona melhor em um smartphone, ao ar livre ou em movimento.</div>
+    <div class="fine">Precisa de HTTPS. Funciona melhor num smartphone, andando ao ar livre.</div>
   </div>
 </div>
 
@@ -188,11 +172,10 @@
   const distEl = document.getElementById('dist');
   const tiltEl = document.getElementById('tilt');
   const barEl = document.getElementById('bar');
+  const placeBtn = document.getElementById('placeBtn');
 
-  // ---------- clock ----------
   function tickClock(){
-    const d = new Date();
-    clockEl.textContent = d.toLocaleTimeString('pt-BR', {hour12:false});
+    clockEl.textContent = new Date().toLocaleTimeString('pt-BR', {hour12:false});
   }
   setInterval(tickClock, 1000);
   tickClock();
@@ -204,10 +187,17 @@
   renderer.setSize(window.innerWidth, window.innerHeight);
 
   const scene = new THREE.Scene();
-  const camera3d = new THREE.PerspectiveCamera(55, window.innerWidth/window.innerHeight, 0.1, 200);
-  camera3d.position.set(0,0,0);
+  const camera3d = new THREE.PerspectiveCamera(60, window.innerWidth/window.innerHeight, 0.05, 300);
+  camera3d.rotation.reorder('YXZ');
 
-  // wireframe cube with subtle glow layers, evokes a focus reticle
+  // ground grid for spatial reference
+  const grid = new THREE.GridHelper(60, 60, 0xffb020, 0x333333);
+  grid.material.transparent = true;
+  grid.material.opacity = 0.12;
+  grid.position.y = -1.4;
+  scene.add(grid);
+
+  // cube: wireframe + faint fill + a base ring so it reads as "planted" at a point
   const cubeGroup = new THREE.Group();
   const geo = new THREE.BoxGeometry(1,1,1);
   const edges = new THREE.EdgesGeometry(geo);
@@ -215,23 +205,18 @@
   const wire = new THREE.LineSegments(edges, mat);
   cubeGroup.add(wire);
 
-  const mat2 = new THREE.MeshBasicMaterial({ color:0xffb020, transparent:true, opacity:0.05, side:THREE.DoubleSide });
-  const faceMesh = new THREE.Mesh(geo, mat2);
-  cubeGroup.add(faceMesh);
+  const faceMat = new THREE.MeshBasicMaterial({ color:0xffb020, transparent:true, opacity:0.06, side:THREE.DoubleSide });
+  cubeGroup.add(new THREE.Mesh(geo, faceMat));
 
+  const ringGeo = new THREE.RingGeometry(0.55, 0.62, 32);
+  const ringMat = new THREE.MeshBasicMaterial({ color:0xffb020, transparent:true, opacity:0.5, side:THREE.DoubleSide });
+  const ring = new THREE.Mesh(ringGeo, ringMat);
+  ring.rotation.x = -Math.PI/2;
+  ring.position.y = -0.5;
+  cubeGroup.add(ring);
+
+  cubeGroup.scale.set(0.55,0.55,0.55);
   scene.add(cubeGroup);
-
-  // starting depth (distance from camera, meters-ish)
-  let depth = 3.0;
-  const MIN_DEPTH = 1.2;
-  const MAX_DEPTH = 40;
-
-  function layoutCube(){
-    cubeGroup.position.set(0,0, -depth);
-    const s = 0.6; // base size in meters
-    cubeGroup.scale.set(s,s,s);
-  }
-  layoutCube();
 
   function onResize(){
     renderer.setSize(window.innerWidth, window.innerHeight);
@@ -240,72 +225,106 @@
   }
   window.addEventListener('resize', onResize);
 
-  // ---------- motion sensors ----------
-  // Sensor 1: devicemotion (accelerometer) -> step/walk detection -> drives depth
-  // Sensor 2: deviceorientation (gyroscope/compass) -> tilts the cube / orbit
+  // ---------- world state ----------
+  // Simple dead-reckoning: track the user's position on a flat plane using
+  // step count (sensor 1: accelerometer) and heading (sensor 2: compass/gyroscope).
+  const STEP_LENGTH = 0.72;   // average step, meters
+  const PLACE_DIST   = 3.0;   // meters in front when placing the cube
 
+  let userPos = { x:0, z:0 };
+  let anchorPos = { x:0, z:-PLACE_DIST };
+  let headingRad = 0; // current compass-ish heading, radians
+
+  function placeCube(){
+    anchorPos.x = userPos.x + Math.sin(headingRad) * PLACE_DIST;
+    anchorPos.z = userPos.z - Math.cos(headingRad) * PLACE_DIST;
+  }
+  placeBtn.addEventListener('click', placeCube);
+
+  // ---------- sensor 1: accelerometer -> steps ----------
   let lastAccMag = 9.8;
   let stepCount = 0;
   let lastStepTime = 0;
-  let walkEnergy = 0; // smoothed "how much walking is happening right now"
 
   function handleMotion(e){
     const a = e.accelerationIncludingGravity || e.acceleration;
     if(!a || a.x === null) return;
     const mag = Math.sqrt((a.x||0)**2 + (a.y||0)**2 + (a.z||0)**2);
     const delta = mag - lastAccMag;
-    lastAccMag = lastAccMag * 0.9 + mag * 0.1; // low-pass baseline
+    lastAccMag = lastAccMag * 0.9 + mag * 0.1;
 
-    // peak detection for a step
     const now = performance.now();
     if(delta > 1.6 && (now - lastStepTime) > 300){
       stepCount++;
       lastStepTime = now;
-      depth = Math.min(MAX_DEPTH, depth + 0.9); // walking pushes the cube further away
       stepsEl.textContent = stepCount;
+      // walking moves the *user* forward along current heading —
+      // the cube, anchored in the world, is left behind.
+      userPos.x += Math.sin(headingRad) * STEP_LENGTH;
+      userPos.z -= Math.cos(headingRad) * STEP_LENGTH;
     }
-
-    // walk energy for smooth continuous feedback
-    walkEnergy = walkEnergy * 0.85 + Math.min(Math.abs(delta), 6) * 0.15;
   }
 
-  let beta = 0, gamma = 0;
+  // ---------- sensor 2: gyroscope/compass -> heading + camera rotation ----------
+  const DEG2RAD = Math.PI/180;
+  let screenOrientRad = 0;
+
+  function updateScreenOrient(){
+    const angle = (screen.orientation && screen.orientation.angle) || window.orientation || 0;
+    screenOrientRad = angle * DEG2RAD;
+  }
+  updateScreenOrient();
+  window.addEventListener('orientationchange', updateScreenOrient);
+
+  // Standard device-orientation -> camera quaternion conversion (world-locked AR look)
+  const zeeAxis = new THREE.Vector3(0,0,1);
+  const euler = new THREE.Euler();
+  const baseQ = new THREE.Quaternion();
+  const minusHalfPiQ = new THREE.Quaternion(-Math.sqrt(0.5), 0, 0, Math.sqrt(0.5));
+  const screenQ = new THREE.Quaternion();
+
+  function applyDeviceQuaternion(alphaDeg, betaDeg, gammaDeg){
+    const alpha = alphaDeg * DEG2RAD;
+    const beta  = betaDeg  * DEG2RAD;
+    const gamma = gammaDeg * DEG2RAD;
+
+    euler.set(beta, alpha, -gamma, 'YXZ');
+    camera3d.quaternion.setFromEuler(euler);
+    camera3d.quaternion.multiply(minusHalfPiQ);
+    camera3d.quaternion.multiply(screenQ.setFromAxisAngle(zeeAxis, -screenOrientRad));
+
+    headingRad = alpha; // reuse compass heading for step dead-reckoning
+  }
+
   function handleOrientation(e){
-    if(e.beta === null) return;
-    beta = e.beta;   // front-back tilt, -180..180
-    gamma = e.gamma; // left-right tilt, -90..90
-    tiltEl.textContent = `${beta.toFixed(0)}° / ${gamma.toFixed(0)}°`;
+    let alpha = e.alpha;
+    if(alpha === null) return;
+    if(typeof e.webkitCompassHeading === 'number'){
+      // iOS gives true compass heading directly (0 = north)
+      alpha = 360 - e.webkitCompassHeading;
+    }
+    applyDeviceQuaternion(alpha, e.beta || 0, e.gamma || 0);
+    tiltEl.textContent = Math.round(((alpha % 360) + 360) % 360) + '°';
   }
 
-  // idle decay: when not walking, cube drifts back closer
+  // ---------- render loop ----------
   function animate(){
     requestAnimationFrame(animate);
 
-    // decay walkEnergy, and when low, ease depth back toward the resting distance
-    walkEnergy *= 0.96;
-    const resting = 3.0;
-    if(walkEnergy < 0.15){
-      depth += (resting - depth) * 0.01;
-    }
-    depth = Math.max(MIN_DEPTH, Math.min(MAX_DEPTH, depth));
+    camera3d.position.set(userPos.x, 0, userPos.z);
+    cubeGroup.position.set(anchorPos.x, 0, anchorPos.z);
+    cubeGroup.rotation.y += 0.004; // slow idle spin so it still reads as "alive"
 
-    layoutCube();
-
-    // orbit/tilt the cube gently using gyroscope, and rotate it on its own axis
-    cubeGroup.rotation.x = THREE.MathUtils.degToRad(beta * 0.25) + performance.now()*0.00012;
-    cubeGroup.rotation.y = THREE.MathUtils.degToRad(gamma * 0.5) + performance.now()*0.00018;
-
-    // color intensity reflects proximity
-    const proximity = 1 - Math.min(1, (depth - MIN_DEPTH) / (MAX_DEPTH - MIN_DEPTH));
-    mat.color.setHSL(0.09, 1, 0.45 + proximity*0.2);
-
-    distEl.textContent = depth.toFixed(1) + ' m';
-    barEl.style.width = (proximity*100).toFixed(0) + '%';
+    const dx = anchorPos.x - userPos.x;
+    const dz = anchorPos.z - userPos.z;
+    const distance = Math.sqrt(dx*dx + dz*dz);
+    distEl.textContent = distance.toFixed(1) + ' m';
+    barEl.style.width = Math.min(100, (distance / 15) * 100).toFixed(0) + '%';
 
     renderer.render(scene, camera3d);
   }
 
-  // ---------- startup flow ----------
+  // ---------- startup ----------
   async function start(){
     errEl.style.display = 'none';
     try{
@@ -315,12 +334,12 @@
       });
       video.srcObject = stream;
     }catch(camErr){
-      errEl.textContent = 'Não foi possível acessar a câmera: ' + camErr.message;
+      errEl.textContent = 'Não foi possível acessar a câmera: ' + camErr.message +
+        '. Isso costuma acontecer se a página não estiver em HTTPS, ou se a permissão foi negada antes — confira nas configurações do site no navegador.';
       errEl.style.display = 'block';
       return;
     }
 
-    // request motion/orientation permission (iOS 13+)
     try{
       if(typeof DeviceMotionEvent !== 'undefined' && typeof DeviceMotionEvent.requestPermission === 'function'){
         const p = await DeviceMotionEvent.requestPermission();
@@ -331,13 +350,14 @@
         if(p2 !== 'granted') throw new Error('permissão de orientação negada');
       }
     }catch(sensorErr){
-      errEl.textContent = 'Sensores de movimento indisponíveis: ' + sensorErr.message + '. A câmera vai funcionar, mas o cubo não vai reagir aos passos.';
+      errEl.textContent = 'Sensores de movimento indisponíveis: ' + sensorErr.message + '. A câmera funciona, mas o cubo não vai reagir aos seus passos nem à direção do celular.';
       errEl.style.display = 'block';
     }
 
     window.addEventListener('devicemotion', handleMotion, true);
     window.addEventListener('deviceorientation', handleOrientation, true);
 
+    placeCube();
     gate.style.display = 'none';
     animate();
   }
