@@ -66,10 +66,17 @@
     object-fit: cover; opacity: 0.95; transition: opacity 0.2s;
   }
   #camPreview.hidden { opacity: 0; pointer-events: none; }
+
+  #vignette {
+    position: fixed; inset: 0; z-index: 3; pointer-events: none; opacity: 0;
+    background: radial-gradient(circle, transparent 45%, rgba(0,0,0,0.85) 100%);
+    transition: opacity 0.08s linear;
+  }
 </style>
 </head>
 <body>
 
+<div id="vignette"></div>
 <div id="hud">
   yaw: <span id="y">0.0</span>° · pitch: <span id="p">0.0</span>°<br>
   <span id="modeY">-</span> · <span id="stillState">-</span>
@@ -110,9 +117,19 @@
 // ================= Cena =================
 const scene = new THREE.Scene();
 
-// "Cabeça" — objeto que gira com yaw/pitch; os 2 olhos são filhos dela
+// "Pescoço" — pivô que gira (yaw + pitch). Os olhos ficam deslocados dele
+// (acima e um pouco à frente), então olhar pra cima/baixo produz um leve
+// arco de paralaxe natural em vez de rotação pura no mesmo ponto — é o
+// "neck model" usado pelo Google Cardboard SDK e apps de VR Theater.
+const neckPivot = new THREE.Object3D();
+scene.add(neckPivot);
+
+const NECK_HEIGHT = 0.18;  // olhos acima do pivô do pescoço
+const NECK_FORWARD = 0.10; // olhos um pouco à frente do pivô
+
 const head = new THREE.Object3D();
-scene.add(head);
+head.position.set(0, NECK_HEIGHT, -NECK_FORWARD);
+neckPivot.add(head);
 
 const IPD = 0.32; // distância entre os "olhos" em unidades de cena (exagerada pra separação notável)
 const eyeL = new THREE.PerspectiveCamera(70, 1, 0.05, 100);
@@ -259,16 +276,26 @@ const DEG_PER_PIXEL_Y = FOV_V_DEG / FINE_H;
 const AGREEMENT_TOLERANCE_PX = 3.5;
 
 const PATCH_HALF = 3;        // patch de 7x7 por ponto
-const SEARCH_RANGE = 5;      // busca ao redor da posição prevista
-const TEXTURE_MIN_VARIANCE = 60; // abaixo disso, patch "liso demais" (céu, parede lisa) -> descarta
+const TEXTURE_MIN_VARIANCE = 60; // abaixo disso, patch "liso demais" -> descarta
 const CONSENSUS_TOLERANCE_PX = 1.6;
 
-// Grade de 9 pontos de rastreio dentro do frame (margem pra caber o patch)
-const TRACK_POINTS = [
-  {x:12,y:9},{x:24,y:9},{x:36,y:9},
-  {x:12,y:18},{x:24,y:18},{x:36,y:18},
-  {x:12,y:27},{x:24,y:27},{x:36,y:27},
+// ---- Camada grossa: poucos pontos, busca ampla -> pega giros rápidos ----
+const COARSE_LAYER = [
+  {x:8,y:7, range:9}, {x:40,y:7, range:9},
+  {x:8,y:29, range:9}, {x:40,y:29, range:9},
 ];
+// ---- Camada fina: grade densa, busca pequena -> precisão no dia a dia ----
+const FINE_LAYER = [
+  {x:10,y:9},{x:19,y:9},{x:29,y:9},{x:38,y:9},
+  {x:10,y:18},{x:19,y:18},{x:29,y:18},{x:38,y:18},
+  {x:10,y:27},{x:19,y:27},{x:29,y:27},{x:38,y:27},
+].map(p => ({ ...p, range: 5 }));
+
+const ALL_POINTS = [...COARSE_LAYER, ...FINE_LAYER];
+// Saúde por ponto (0-1): sobe quando o ponto concorda com o consenso, cai
+// quando discorda ou fica sem textura — pontos "problemáticos" perdem peso
+// gradualmente em vez de continuar contando igual aos bons.
+const pointHealth = ALL_POINTS.map(() => 1.0);
 
 let cameraActive = false;
 const videoEl = document.getElementById('camPreview');
@@ -307,12 +334,12 @@ function patchVariance(img, w, cx, cy) {
   return sumSq / count - mean * mean;
 }
 
-function trackPoint(prev, curr, w, h, px, py, centerDx, centerDy) {
+function trackPoint(prev, curr, w, h, px, py, centerDx, centerDy, range) {
   let bestDx = centerDx, bestDy = centerDy, bestScore = Infinity;
-  for (let dy = centerDy - SEARCH_RANGE; dy <= centerDy + SEARCH_RANGE; dy++) {
+  for (let dy = centerDy - range; dy <= centerDy + range; dy++) {
     const sy = py + dy;
     if (sy - PATCH_HALF < 0 || sy + PATCH_HALF >= h) continue;
-    for (let dx = centerDx - SEARCH_RANGE; dx <= centerDx + SEARCH_RANGE; dx++) {
+    for (let dx = centerDx - range; dx <= centerDx + range; dx++) {
       const sx = px + dx;
       if (sx - PATCH_HALF < 0 || sx + PATCH_HALF >= w) continue;
       let sad = 0;
@@ -351,6 +378,17 @@ function beep(freq, durationMs) {
   } catch (e) {}
 }
 
+function weightedMedian(items) { // items: [{value, weight}]
+  const sorted = [...items].sort((a,b) => a.value - b.value);
+  const totalWeight = sorted.reduce((s,i) => s + i.weight, 0);
+  let acc = 0;
+  for (const it of sorted) {
+    acc += it.weight;
+    if (acc >= totalWeight / 2) return it.value;
+  }
+  return sorted[sorted.length - 1].value;
+}
+
 let yawVelocity = 0; // rad/s — usado pra extrapolar movimento suave entre leituras da câmera
 let lastYawTickTime = performance.now();
 
@@ -360,22 +398,39 @@ function opticalFlowTick() {
   const currFine = toGray(fineCtx, FINE_W, FINE_H);
 
   if (prevFine) {
-    const results = [];
-    for (const pt of TRACK_POINTS) {
-      if (patchVariance(prevFine, FINE_W, pt.x, pt.y) < TEXTURE_MIN_VARIANCE) continue; // sem textura, pula
-      const r = trackPoint(prevFine, currFine, FINE_W, FINE_H, pt.x, pt.y, Math.round(predictedDx), Math.round(predictedDy));
-      results.push(r);
+    const results = []; // { idx, dx, dy, health }
+    for (let i = 0; i < ALL_POINTS.length; i++) {
+      const pt = ALL_POINTS[i];
+      if (patchVariance(prevFine, FINE_W, pt.x, pt.y) < TEXTURE_MIN_VARIANCE) {
+        pointHealth[i] = Math.max(0, pointHealth[i] - 0.15); // sem textura -> perde saúde
+        continue;
+      }
+      const r = trackPoint(prevFine, currFine, FINE_W, FINE_H, pt.x, pt.y,
+        Math.round(predictedDx), Math.round(predictedDy), pt.range);
+      results.push({ idx: i, dx: r.dx, dy: r.dy });
     }
 
-    if (results.length >= 3) {
-      const dxs = results.map(r => r.dx);
-      const dys = results.map(r => r.dy);
-      const medDx = median(dxs);
-      const medDy = median(dys);
-      const inliers = results.filter(r => Math.abs(r.dx - medDx) <= CONSENSUS_TOLERANCE_PX);
+    if (results.length >= 4) {
+      // Mediana simples primeiro, só pra achar o consenso inicial
+      const roughMedDx = median(results.map(r => r.dx));
+      const inliers = results.filter(r => Math.abs(r.dx - roughMedDx) <= CONSENSUS_TOLERANCE_PX);
+
+      // Atualiza a saúde de cada ponto: sobe se foi inlier, cai se foi outlier
+      for (const r of results) {
+        const wasInlier = Math.abs(r.dx - roughMedDx) <= CONSENSUS_TOLERANCE_PX;
+        pointHealth[r.idx] = THREE.MathUtils.clamp(
+          pointHealth[r.idx] + (wasInlier ? 0.08 : -0.25), 0.05, 1.0
+        );
+      }
+
+      // Mediana ponderada pela saúde -> pontos historicamente ruins pesam menos
+      const weightedItems = results.map(r => ({ value: r.dx, weight: pointHealth[r.idx] }));
+      const weightedItemsY = results.map(r => ({ value: r.dy, weight: pointHealth[r.idx] }));
+      const medDx = weightedMedian(weightedItems);
+      const medDy = weightedMedian(weightedItemsY);
       const consensus = inliers.length / results.length;
 
-      predictedDx = medDx; predictedDy = medDy; // previsão pro próximo frame
+      predictedDx = medDx; predictedDy = medDy;
 
       const accelPitchDeltaDeg = THREE.MathUtils.radToDeg(rawPitch - prevRawPitchAtTick);
       const expectedVerticalPx = accelPitchDeltaDeg / DEG_PER_PIXEL_Y;
@@ -389,7 +444,7 @@ function opticalFlowTick() {
       const cameraStill = dxHistory.length === DX_HISTORY_SIZE && avgAbsDx < CAMERA_STILL_DX_LIMIT;
 
       const stillEl = document.getElementById('stillState');
-      stillEl.textContent = cameraStill ? 'parado' : 'movendo';
+      stillEl.textContent = cameraStill ? 'parado' : `movendo (${inliers.length}/${results.length} pts)`;
 
       const stillnessFactor = cameraStill ? 0.15 : 1;
       const trust = consensus * (0.5 + 0.5*agreement) * stillnessFactor;
@@ -402,13 +457,12 @@ function opticalFlowTick() {
         const deltaDeg = -medDx * DEG_PER_PIXEL_X;
         const deltaRad = THREE.MathUtils.degToRad(deltaDeg) * trust;
         yaw += deltaRad;
-        yawVelocity = yawVelocity * 0.5 + (deltaRad / dt) * 0.5; // suaviza a velocidade estimada
-        if (!cameraStill) document.getElementById('modeY').textContent = 'câmera (9 pts)';
+        yawVelocity = yawVelocity * 0.5 + (deltaRad / dt) * 0.5;
+        if (!cameraStill) document.getElementById('modeY').textContent = 'câmera (2 camadas)';
       } else {
-        yawVelocity *= 0.6; // sem confiança -> desacelera a extrapolação em vez de travar de repente
+        yawVelocity *= 0.6;
       }
 
-      // Bipe quando a qualidade do rastreio piora (útil sem ver a tela dentro da caixa)
       const trackingGoodNow = consensus > 0.5;
       if (wasTrackingGood && !trackingGoodNow && performance.now() - lastBeepTime > 1500) {
         beep(280, 150); lastBeepTime = performance.now();
@@ -532,13 +586,17 @@ document.getElementById('vrBtn').addEventListener('click', async () => {
 function animate() {
   requestAnimationFrame(animate);
 
-  // Extrapola o yaw usando a velocidade estimada, pra não "escadar" entre
-  // as leituras da câmera (que rodam a ~12Hz, bem mais devagar que os 60fps da tela)
   const dtFrame = Math.min(0.05, (performance.now() - lastYawTickTime) / 1000);
   const yawExtrapolated = yaw + yawVelocity * dtFrame * 0.4;
 
-  head.rotation.y += (yawExtrapolated - head.rotation.y) * 0.35;
-  head.rotation.x += (pitch - head.rotation.x) * 0.2;
+  neckPivot.rotation.y += (yawExtrapolated - neckPivot.rotation.y) * 0.35;
+  neckPivot.rotation.x += (pitch - neckPivot.rotation.x) * 0.2;
+
+  // Vinheta de conforto: escurece as bordas durante giros rápidos, técnica
+  // padrão em apps de VR pra reduzir a sensação de enjoo (motion sickness)
+  const speedDeg = Math.abs(THREE.MathUtils.radToDeg(yawVelocity));
+  const vignetteStrength = Math.min(0.55, speedDeg / 260);
+  document.getElementById('vignette').style.opacity = vignetteStrength.toFixed(2);
 
   document.getElementById('p').textContent = THREE.MathUtils.radToDeg(pitch).toFixed(1);
   document.getElementById('y').textContent = THREE.MathUtils.radToDeg(yaw).toFixed(1);
