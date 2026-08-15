@@ -61,19 +61,18 @@
 <body>
 
 <div id="hud">
-  modo pitch/roll: <span class="mode" id="modePR">-</span><br>
-  modo yaw: <span class="mode" id="modeY">-</span><br>
+  modo cima/baixo: <span class="mode" id="modePR">-</span><br>
+  modo esquerda/direita: <span class="mode" id="modeY">-</span><br>
   rastreio: <span id="trackStatus">-</span><br>
-  pitch: <span id="p">0.0</span>°<br>
-  roll: <span id="r">0.0</span>°<br>
-  yaw: <span id="y">0.0</span>°
+  cima/baixo: <span id="p">0.0</span>°<br>
+  esquerda/direita: <span id="y">0.0</span>°
 </div>
 
 <video id="camPreview" playsinline autoplay muted></video>
 
 <div id="controls">
   <button id="invertBtn">Inverter direção</button>
-  <button id="resetBtn">Reset yaw</button>
+  <button id="resetBtn">Recentralizar cubo</button>
 </div>
 
 <div id="hint">
@@ -123,11 +122,15 @@ addEventListener('resize', () => {
 });
 
 // ================= Estado de rotação =================
-let pitch = 0, roll = 0, yaw = 0;
+// Só 2 eixos: pitch (cima/baixo, via sensor) e yaw (esquerda/direita, via câmera).
+// Roll (inclinar de lado) foi removido de propósito.
+let pitch = 0, yaw = 0;
+let pitchOffset = 0;   // calibração: "zero" = posição em que o celular estava ao recentralizar
+let rawPitch = 0;
 document.getElementById('modePR').textContent = 'aguardando';
 document.getElementById('modeY').textContent = 'aguardando';
 
-// ================= Acelerômetro -> pitch/roll =================
+// ================= Acelerômetro -> pitch (cima/baixo) =================
 let fx = 0, fy = 0, fz = 0, accelFirst = true;
 const ALPHA_LP = 0.15;
 let orientationGaveRealBeta = false;
@@ -142,17 +145,17 @@ function handleMotion(e) {
     fy += (g.y - fy) * ALPHA_LP;
     fz += (g.z - fz) * ALPHA_LP;
   }
-  pitch = Math.atan2(-fy, Math.sqrt(fx*fx + fz*fz));
-  roll = Math.atan2(fx, fz);
+  rawPitch = Math.atan2(-fy, Math.sqrt(fx*fx + fz*fz));
+  pitch = rawPitch - pitchOffset;
   document.getElementById('modePR').textContent = 'acelerômetro';
 }
 
-// Se por acaso o giroscópio real existir, usamos ele e ignoramos o resto
+// Se por acaso o giroscópio real existir, usamos ele só pro pitch (ignoramos beta/gamma como roll)
 function handleOrientation(e) {
-  if (typeof e.beta === 'number' && typeof e.gamma === 'number') {
+  if (typeof e.beta === 'number') {
     orientationGaveRealBeta = true;
-    pitch = THREE.MathUtils.degToRad(e.beta);
-    roll = THREE.MathUtils.degToRad(e.gamma);
+    rawPitch = THREE.MathUtils.degToRad(e.beta);
+    pitch = rawPitch - pitchOffset;
     document.getElementById('modePR').textContent = 'giroscópio';
   }
   if (typeof e.alpha === 'number' && !cameraActive) {
@@ -257,7 +260,11 @@ document.body.addEventListener('touchmove', (e) => {
 document.body.addEventListener('touchend', () => { lastTouchX = null; });
 
 document.getElementById('invertBtn').addEventListener('click', () => { invertDir *= -1; });
-document.getElementById('resetBtn').addEventListener('click', () => { yaw = 0; });
+document.getElementById('resetBtn').addEventListener('click', () => {
+  yaw = 0;
+  pitchOffset = rawPitch; // a posição atual do celular vira o novo "centro" (0°)
+  pitch = 0;
+});
 
 // ================= Ativação / permissões =================
 document.getElementById('startBtn').addEventListener('click', async () => {
@@ -281,11 +288,10 @@ document.getElementById('startBtn').addEventListener('click', async () => {
 function animate() {
   requestAnimationFrame(animate);
   cube.rotation.x += (pitch - cube.rotation.x) * 0.15;
-  cube.rotation.z += (roll - cube.rotation.z) * 0.15;
+  cube.rotation.z = 0; // roll removido de propósito — sem inclinação lateral
   cube.rotation.y += (yaw - cube.rotation.y) * 0.3; // yaw responde mais rápido (já vem incremental)
 
   document.getElementById('p').textContent = THREE.MathUtils.radToDeg(pitch).toFixed(1);
-  document.getElementById('r').textContent = THREE.MathUtils.radToDeg(roll).toFixed(1);
   document.getElementById('y').textContent = THREE.MathUtils.radToDeg(yaw).toFixed(1);
 
   renderer.render(scene, camera);
