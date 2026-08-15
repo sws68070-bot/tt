@@ -1,324 +1,296 @@
 <!DOCTYPE html>
 <html lang="pt-BR">
 <head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-<title>Sensor Lab — DEPTH</title>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no, viewport-fit=cover">
+<title>Emulador de Giroscópio — VIO</title>
 <style>
-  :root{ --bg:#05070a; --card:#0b1116; --accent:#ffb020; --text:#e8eef2; }
-  *{box-sizing:border-box}
-  body{margin:0; font-family:Inter,system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial; background:linear-gradient(180deg,#040608 0%,#071018 100%); color:var(--text); min-height:100vh;}
-  header{padding:18px 20px; display:flex; align-items:center; gap:12px}
-  h1{font-size:18px;margin:0}
-  p.lead{margin:6px 0 0; color:rgba(232,238,242,0.7); font-size:13px}
-  main{padding:18px; display:grid; grid-template-columns:1fr 360px; gap:18px}
-  .card{background:rgba(255,255,255,0.02); border:1px solid rgba(255,255,255,0.04); padding:14px; border-radius:8px}
-  .controls{display:flex; gap:10px}
-  button{background:var(--accent); border:none; color:#071018; padding:10px 12px; border-radius:6px; font-weight:600; cursor:pointer}
-  button.ghost{background:transparent; border:1px solid rgba(255,255,255,0.06); color:var(--text)}
-  .grid{display:grid; grid-template-columns:1fr 1fr; gap:10px}
-  .sensor{padding:10px; background:rgba(255,255,255,0.01); border-radius:6px; font-family:monospace; font-size:13px}
-  .label{font-size:12px; color:rgba(232,238,242,0.6)}
-  .val{font-size:15px; color:var(--accent); font-weight:700}
-  .small{font-size:12px; color:rgba(232,238,242,0.6)}
-  #log{height:220px; overflow:auto; background:rgba(0,0,0,0.12); padding:8px; border-radius:6px; font-family:monospace; font-size:12px}
-  footer{padding:12px 18px; font-size:12px; color:rgba(232,238,242,0.6)}
-  @media(max-width:880px){ main{grid-template-columns:1fr; } }
+  html, body {
+    margin: 0; padding: 0; overflow: hidden;
+    width: 100%; height: 100%;
+    background: #05070a;
+    font-family: -apple-system, system-ui, sans-serif;
+    touch-action: none;
+  }
+  canvas { display: block; }
+
+  #overlay {
+    position: fixed; inset: 0;
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    background: rgba(5,7,10,0.96); z-index: 10; color: #fff; text-align: center; padding: 24px;
+  }
+  #overlay h2 { margin-bottom: 6px; }
+  #overlay p { color: rgba(255,255,255,0.6); font-size: 13px; max-width: 340px; line-height: 1.5; }
+  #overlay button {
+    margin-top: 22px; padding: 14px 32px; font-size: 16px; border-radius: 10px;
+    border: none; background: #ffb020; color: #071018; font-weight: 700;
+  }
+
+  #hud {
+    position: fixed; top: 12px; left: 12px; color: #9fd; font-size: 12px;
+    background: rgba(0,0,0,0.4); padding: 10px 14px; border-radius: 8px;
+    font-family: monospace; line-height: 1.6; z-index: 5; pointer-events: none;
+    min-width: 165px;
+  }
+  #hud .mode { color: #ffb020; font-weight: 700; }
+  #hud .warn { color: #ff6b6b; }
+  #hud .ok { color: #6bffb0; }
+
+  #camPreview {
+    position: fixed; top: 12px; right: 12px; width: 90px; height: 68px;
+    border-radius: 8px; border: 2px solid rgba(255,176,32,0.6); z-index: 6;
+    object-fit: cover; opacity: 0.9;
+  }
+
+  #hint {
+    position: fixed; bottom: 14px; left: 14px; right: 14px;
+    background: rgba(255,255,255,0.06); color: rgba(255,255,255,0.75); padding: 10px 12px;
+    border-radius: 8px; font-size: 11.5px; line-height: 1.4; z-index: 6; text-align: center;
+  }
+
+  #controls {
+    position: fixed; bottom: 90px; right: 14px; z-index: 6;
+    display: flex; flex-direction: column; gap: 6px; align-items: flex-end;
+  }
+  #controls button {
+    padding: 9px 14px; border-radius: 8px; border: 1px solid rgba(255,255,255,0.2);
+    background: rgba(255,255,255,0.08); color: #fff; font-size: 11.5px;
+  }
 </style>
 </head>
 <body>
-<header>
-  <div>
-    <h1>Sensor Lab — DEPTH</h1>
-    <p class="lead">Visualizador de sensores do celular — acelerômetro, giroscópio, magnetômetro, orientação absoluta e eventos legacy.</p>
-  </div>
-</header>
-<main>
-  <section class="card">
-    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
-      <div class="small">Clique em <b>Iniciar</b> num smartphone (em HTTPS) para ativar sensores.</div>
-      <div class="controls">
-        <button id="startBtn">Iniciar</button>
-        <button id="stopBtn" class="ghost">Parar</button>
-      </div>
-    </div>
 
-    <div class="grid">
-      <div class="sensor">
-        <div class="label">Acelerômetro (linear)</div>
-        <div class="val" id="accel">—</div>
-      </div>
+<div id="hud">
+  modo pitch/roll: <span class="mode" id="modePR">-</span><br>
+  modo yaw: <span class="mode" id="modeY">-</span><br>
+  rastreio: <span id="trackStatus">-</span><br>
+  pitch: <span id="p">0.0</span>°<br>
+  roll: <span id="r">0.0</span>°<br>
+  yaw: <span id="y">0.0</span>°
+</div>
 
-      <div class="sensor">
-        <div class="label">Aceleração (incl. gravidade)</div>
-        <div class="val" id="accelG">—</div>
-      </div>
+<video id="camPreview" playsinline autoplay muted></video>
 
-      <div class="sensor">
-        <div class="label">Giro / Giroscópio (º/s)</div>
-        <div class="val" id="gyro">—</div>
-      </div>
+<div id="controls">
+  <button id="invertBtn">Inverter direção</button>
+  <button id="resetBtn">Reset yaw</button>
+</div>
 
-      <div class="sensor">
-        <div class="label">Orientação (alpha, beta, gamma)</div>
-        <div class="val" id="orientation">—</div>
-      </div>
+<div id="hint">
+  Yaw vem da câmera (fluxo ótico) — aponte pra algo com textura/detalhe e boa luz.
+  Se perder rastreio, arraste o dedo pra girar manualmente.
+</div>
 
-      <div class="sensor">
-        <div class="label">Magnetômetro</div>
-        <div class="val" id="mag">—</div>
-      </div>
+<div id="overlay">
+  <h2>Emulador de Giroscópio — VIO</h2>
+  <p>
+    Combina acelerômetro (inclinação) + câmera (rastreio visual de pontos pra
+    estimar giro horizontal) — o mesmo princípio usado em AR, só que
+    simplificado. Precisa de permissão de câmera e movimento.
+  </p>
+  <button id="startBtn">Ativar</button>
+</div>
 
-      <div class="sensor">
-        <div class="label">Quaternion / orientação absoluta</div>
-        <div class="val" id="quat">—</div>
-      </div>
-    </div>
-
-    <hr style="margin:12px 0;border:none;border-top:1px solid rgba(255,255,255,0.04)">
-
-    <div style="display:flex;gap:12px;flex-wrap:wrap">
-      <div style="flex:1">
-        <div class="label">Status das APIs</div>
-        <div id="status" class="small" style="margin-top:6px"></div>
-      </div>
-      <div style="width:220px">
-        <div class="label">Permissões</div>
-        <div id="perms" class="small" style="margin-top:6px"></div>
-      </div>
-    </div>
-
-    <div style="margin-top:12px">
-      <div class="label">Log / Erros</div>
-      <div id="log"></div>
-    </div>
-  </section>
-
-  <aside class="card">
-    <div style="margin-bottom:12px"><strong>Diagnóstico</strong></div>
-    <div class="small" style="margin-bottom:8px">APIs detectadas:</div>
-    <div id="apis" class="small" style="margin-bottom:12px"></div>
-
-    <div class="small" style="margin-bottom:8px">Câmera (prévia) — opcional:</div>
-    <video id="cam" playsinline autoplay muted style="width:100%;border-radius:6px;background:#000"></video>
-
-    <div style="margin-top:12px" class="small">Instruções rápidas:</div>
-    <ul class="small">
-      <li>O site precisa rodar em HTTPS (ou localhost).</li>
-      <li>No iOS Safari, permita acesso a movimento e orientação quando solicitado.</li>
-      <li>Se não aparecer nada, verifique permissões do site nas configurações do navegador.</li>
-    </ul>
-  </aside>
-</main>
-
-<footer>
-  Deploy automático: este arquivo foi adicionado ao repositório para teste de sensores.
-</footer>
-
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
 <script>
-(function(){
-  const startBtn = document.getElementById('startBtn');
-  const stopBtn = document.getElementById('stopBtn');
-  const logEl = document.getElementById('log');
-  const statusEl = document.getElementById('status');
-  const permsEl = document.getElementById('perms');
-  const apisEl = document.getElementById('apis');
+// ================= Cena Three.js =================
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(60, innerWidth/innerHeight, 0.1, 100);
+camera.position.z = 4;
 
-  const accelEl = document.getElementById('accel');
-  const accelGEl = document.getElementById('accelG');
-  const gyroEl = document.getElementById('gyro');
-  const orientationEl = document.getElementById('orientation');
-  const magEl = document.getElementById('mag');
-  const quatEl = document.getElementById('quat');
-  const videoEl = document.getElementById('cam');
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(innerWidth, innerHeight);
+renderer.setPixelRatio(devicePixelRatio);
+document.body.appendChild(renderer.domElement);
 
-  let sensors = {
-    linearAccel: null,
-    accel: null,
-    gyro: null,
-    mag: null,
-    orient: null
-  };
-  let legacyHandlers = { motion: null, orientation: null };
-  let camStream = null;
+scene.add(new THREE.AmbientLight(0x808080));
+const dirLight = new THREE.DirectionalLight(0xffffff, 1);
+dirLight.position.set(3, 5, 4);
+scene.add(dirLight);
 
-  function log(msg){
-    const t = new Date().toLocaleTimeString();
-    logEl.innerHTML = `<div>[${t}] ${msg}</div>` + logEl.innerHTML;
+const colors = [0xff4f4f, 0x4fff88, 0x4f8cff, 0xffe14f, 0xff4fe1, 0x4ffff2];
+const materials = colors.map(c => new THREE.MeshStandardMaterial({ color: c }));
+const geometry = new THREE.BoxGeometry(1.6, 1.6, 1.6);
+const cube = new THREE.Mesh(geometry, materials);
+scene.add(cube);
+const edges = new THREE.EdgesGeometry(geometry);
+cube.add(new THREE.LineSegments(edges, new THREE.LineBasicMaterial({ color: 0x000000 })));
+
+addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+
+// ================= Estado de rotação =================
+let pitch = 0, roll = 0, yaw = 0;
+document.getElementById('modePR').textContent = 'aguardando';
+document.getElementById('modeY').textContent = 'aguardando';
+
+// ================= Acelerômetro -> pitch/roll =================
+let fx = 0, fy = 0, fz = 0, accelFirst = true;
+const ALPHA_LP = 0.15;
+let orientationGaveRealBeta = false;
+
+function handleMotion(e) {
+  const g = e.accelerationIncludingGravity;
+  if (!g || typeof g.x !== 'number' || orientationGaveRealBeta) return;
+
+  if (accelFirst) { fx=g.x; fy=g.y; fz=g.z; accelFirst=false; }
+  else {
+    fx += (g.x - fx) * ALPHA_LP;
+    fy += (g.y - fy) * ALPHA_LP;
+    fz += (g.z - fz) * ALPHA_LP;
   }
+  pitch = Math.atan2(-fy, Math.sqrt(fx*fx + fz*fz));
+  roll = Math.atan2(fx, fz);
+  document.getElementById('modePR').textContent = 'acelerômetro';
+}
 
-  function setStatus(){
-    const detects = [];
-    detects.push('AbsoluteOrientationSensor:' + (!!window.AbsoluteOrientationSensor));
-    detects.push('RelativeOrientationSensor:' + (!!window.RelativeOrientationSensor));
-    detects.push('LinearAccelerationSensor:' + (!!window.LinearAccelerationSensor));
-    detects.push('Accelerometer:' + (!!window.Accelerometer));
-    detects.push('Gyroscope:' + (!!window.Gyroscope));
-    detects.push('Magnetometer:' + (!!window.Magnetometer));
-    detects.push('DeviceMotionEvent:' + (!!window.DeviceMotionEvent));
-    detects.push('DeviceOrientationEvent:' + (!!window.DeviceOrientationEvent));
-    apisEl.textContent = detects.join('\n');
+// Se por acaso o giroscópio real existir, usamos ele e ignoramos o resto
+function handleOrientation(e) {
+  if (typeof e.beta === 'number' && typeof e.gamma === 'number') {
+    orientationGaveRealBeta = true;
+    pitch = THREE.MathUtils.degToRad(e.beta);
+    roll = THREE.MathUtils.degToRad(e.gamma);
+    document.getElementById('modePR').textContent = 'giroscópio';
   }
-  setStatus();
-
-  function setPerms(text){ permsEl.textContent = text; }
-
-  async function startCamera(){
-    if(!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) return;
-    try{
-      camStream = await navigator.mediaDevices.getUserMedia({video:{facingMode:'environment'}, audio:false});
-      videoEl.srcObject = camStream;
-    }catch(e){ log('camera erro: ' + e.message); }
+  if (typeof e.alpha === 'number' && !cameraActive) {
+    yaw = THREE.MathUtils.degToRad(360 - e.alpha);
+    document.getElementById('modeY').textContent = 'bússola';
   }
+}
 
-  function stopCamera(){ if(camStream){ camStream.getTracks().forEach(t=>t.stop()); camStream=null; videoEl.srcObject=null; }}
+// ================= Câmera -> fluxo ótico (yaw) =================
+const W = 48, H = 36;       // resolução reduzida pro block matching
+const MAX_SHIFT = 8;         // busca de até 8px em cada direção
+const FOV_H_DEG = 60;        // campo de visão horizontal aproximado
+const DEG_PER_PIXEL = FOV_H_DEG / W;
+const NOISE_SCORE_LIMIT = 14; // acima disso, consideramos "sem textura suficiente"
 
-  function startGeneric(){
-    let ok = false;
-    try{
-      const Absolute = window.AbsoluteOrientationSensor || window.RelativeOrientationSensor;
-      if(Absolute){
-        sensors.orient = new Absolute({frequency:60});
-        sensors.orient.addEventListener('reading', ()=>{
-          const q = sensors.orient.quaternion; if(q && q.length>=4){ quatEl.textContent = q.map(n=>n.toFixed(3)).join(', '); }
-        });
-        sensors.orient.addEventListener('error', ev=>{ log('orient sensor erro: ' + ev.error); });
-        sensors.orient.start(); ok = true;
+let cameraActive = false;
+let invertDir = 1;
+const videoEl = document.getElementById('camPreview');
+const sampleCanvas = document.createElement('canvas');
+sampleCanvas.width = W; sampleCanvas.height = H;
+const sampleCtx = sampleCanvas.getContext('2d', { willReadFrequently: true });
+let prevGray = null;
+
+function grabGray() {
+  sampleCtx.drawImage(videoEl, 0, 0, W, H);
+  const data = sampleCtx.getImageData(0, 0, W, H).data;
+  const gray = new Float32Array(W * H);
+  for (let i = 0; i < W * H; i++) {
+    gray[i] = 0.299*data[i*4] + 0.587*data[i*4+1] + 0.114*data[i*4+2];
+  }
+  return gray;
+}
+
+function estimateShiftX(prev, curr) {
+  let bestDx = 0, bestScore = Infinity;
+  for (let dx = -MAX_SHIFT; dx <= MAX_SHIFT; dx++) {
+    let sad = 0, count = 0;
+    for (let yy = 4; yy < H - 4; yy++) {
+      for (let xx = 4; xx < W - 4; xx++) {
+        const sx = xx + dx;
+        if (sx < 0 || sx >= W) continue;
+        sad += Math.abs(curr[yy*W + xx] - prev[yy*W + sx]);
+        count++;
       }
-    }catch(e){ log('startAbsolute erro: ' + e.message); }
-
-    try{
-      if(window.LinearAccelerationSensor){
-        sensors.linearAccel = new LinearAccelerationSensor({frequency:60});
-        sensors.linearAccel.addEventListener('reading', ()=>{
-          accelEl.textContent = [sensors.linearAccel.x, sensors.linearAccel.y, sensors.linearAccel.z].map(v=> (v||0).toFixed(3)).join(', ');
-        });
-        sensors.linearAccel.addEventListener('error', ev=>{ log('linear accel erro: ' + ev.error); });
-        sensors.linearAccel.start(); ok = true;
-      }else if(window.Accelerometer){
-        sensors.accel = new Accelerometer({frequency:60});
-        sensors.accel.addEventListener('reading', ()=>{
-          accelEl.textContent = [sensors.accel.x, sensors.accel.y, sensors.accel.z].map(v=> (v||0).toFixed(3)).join(', ');
-        });
-        sensors.accel.start(); ok = true;
-      }
-    }catch(e){ log('start accel erro: ' + e.message); }
-
-    try{
-      if(window.Gyroscope){
-        sensors.gyro = new Gyroscope({frequency:60});
-        sensors.gyro.addEventListener('reading', ()=>{
-          gyroEl.textContent = [sensors.gyro.x, sensors.gyro.y, sensors.gyro.z].map(v=> (v||0).toFixed(3)).join(', ');
-        });
-        sensors.gyro.start(); ok = true;
-      }
-    }catch(e){ log('start gyro erro: ' + e.message); }
-
-    try{
-      if(window.Magnetometer){
-        sensors.mag = new Magnetometer({frequency:10});
-        sensors.mag.addEventListener('reading', ()=>{
-          magEl.textContent = [sensors.mag.x, sensors.mag.y, sensors.mag.z].map(v=> (v||0).toFixed(3)).join(', ');
-        });
-        sensors.mag.start(); ok = true;
-      }
-    }catch(e){ log('start mag erro: ' + e.message); }
-
-    return ok;
-  }
-
-  function stopGeneric(){
-    Object.keys(sensors).forEach(k=>{
-      try{ if(sensors[k] && typeof sensors[k].stop === 'function') sensors[k].stop(); }catch(e){}
-      sensors[k]=null;
-    });
-  }
-
-  function startLegacy(){
-    // devicemotion
-    legacyHandlers.motion = function(e){
-      const a = e.acceleration; const ag = e.accelerationIncludingGravity; const r = `a:${(a&&[a.x,a.y,a.z].map(v=>v?v.toFixed(3):'0.000').join(','))} / ag:${(ag&&[ag.x,ag.y,ag.z].map(v=>v?v.toFixed(3):'0.000').join(','))}`;
-      accelEl.textContent = a? [a.x,a.y,a.z].map(v=> (v||0).toFixed(3)).join(', ') : '—';
-      accelGEl.textContent = ag? [ag.x,ag.y,ag.z].map(v=> (v||0).toFixed(3)).join(', ') : '—';
-    };
-    window.addEventListener('devicemotion', legacyHandlers.motion, true);
-
-    legacyHandlers.orientation = function(e){
-      const a = e.alpha, b = e.beta, g = e.gamma;
-      orientationEl.textContent = (typeof a === 'number') ? [a.toFixed(1), b.toFixed(1), g.toFixed(1)].join(', ') : '—';
-      // show quaternion approx via Euler conversion (not exact but gives yaw)
-      quatEl.textContent = (typeof a === 'number') ? `α:${a.toFixed(1)}°` : '—';
-    };
-    window.addEventListener('deviceorientation', legacyHandlers.orientation, true);
-  }
-
-  function stopLegacy(){
-    if(legacyHandlers.motion) window.removeEventListener('devicemotion', legacyHandlers.motion, true);
-    if(legacyHandlers.orientation) window.removeEventListener('deviceorientation', legacyHandlers.orientation, true);
-    legacyHandlers.motion = legacyHandlers.orientation = null;
-  }
-
-  async function startAll(){
-    log('Iniciando — pedindo permissões quando necessário');
-    setPerms('pedindo...');
-    // request iOS permissions
-    try{
-      if(typeof DeviceMotionEvent !== 'undefined' && typeof DeviceMotionEvent.requestPermission === 'function'){
-        const r = await DeviceMotionEvent.requestPermission(); log('DeviceMotion permission: ' + r); setPerms(prev => {});
-      }
-    }catch(e){ log('DeviceMotion permission erro: ' + e.message); }
-    try{
-      if(typeof DeviceOrientationEvent !== 'undefined' && typeof DeviceOrientationEvent.requestPermission === 'function'){
-        const r2 = await DeviceOrientationEvent.requestPermission(); log('DeviceOrientation permission: ' + r2);
-      }
-    }catch(e){ log('DeviceOrientation permission erro: ' + e.message); }
-
-    // start camera (optional) — do not block
-    startCamera().then(()=>log('camera iniciada')).catch(e=>log('camera falhou: '+(e.message||e)));
-
-    const genericWorked = startGeneric();
-    if(!genericWorked){
-      log('Generic Sensor API indisponível ou falhou — usando eventos legacy');
-      startLegacy();
-      setPerms('usando eventos legacy (devicemotion/deviceorientation)');
-    }else{
-      log('Generic Sensor API iniciada (alguns sensores)');
-      setPerms('Generic Sensor API (quando disponível)');
-      // still attach legacy orientation as fallback for alpha on some devices
-      window.addEventListener('deviceorientation', function(e){ if(typeof e.alpha === 'number') orientationEl.textContent = [e.alpha.toFixed(1), (e.beta||0).toFixed(1), (e.gamma||0).toFixed(1)].join(', '); }, true);
     }
-
-    statusEl.textContent = 'rodando';
+    const score = sad / count;
+    if (score < bestScore) { bestScore = score; bestDx = dx; }
   }
+  return { dx: bestDx, score: bestScore };
+}
 
-  function stopAll(){
-    stopGeneric(); stopLegacy(); stopCamera(); statusEl.textContent = 'parado'; log('parado');
+function opticalFlowTick() {
+  if (!cameraActive) return;
+  const curr = grabGray();
+  if (prevGray) {
+    const { dx, score } = estimateShiftX(prevGray, curr);
+    const statusEl = document.getElementById('trackStatus');
+    if (score < NOISE_SCORE_LIMIT) {
+      // pontos da cena moveram dx pixels -> dispositivo girou na direção oposta
+      const deltaDeg = -dx * DEG_PER_PIXEL * invertDir;
+      yaw += THREE.MathUtils.degToRad(deltaDeg);
+      statusEl.textContent = 'rastreando';
+      statusEl.className = 'ok';
+      document.getElementById('modeY').textContent = 'câmera';
+    } else {
+      statusEl.textContent = 'sem textura/luz';
+      statusEl.className = 'warn';
+    }
   }
+  prevGray = curr;
+}
 
-  startBtn.addEventListener('click', async ()=>{
-    try{
-      await startAll();
-    }catch(e){ log('startAll erro: '+(e.message||e)); }
-  });
-  stopBtn.addEventListener('click', ()=>stopAll());
+async function startCamera() {
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: 'environment', width: 320, height: 240 }, audio: false
+    });
+    videoEl.srcObject = stream;
+    await videoEl.play();
+    cameraActive = true;
+    setInterval(opticalFlowTick, 80); // ~12x por segundo, leve o suficiente
+  } catch (err) {
+    document.getElementById('trackStatus').textContent = 'câmera negada';
+    document.getElementById('trackStatus').className = 'warn';
+    document.getElementById('modeY').textContent = 'toque (sem câmera)';
+  }
+}
 
-  // initial feature list
-  setTimeout(()=>{
-    const f = [];
-    f.push('navigator.mediaDevices:' + !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia));
-    f.push('AbsoluteOrientationSensor:' + !!window.AbsoluteOrientationSensor);
-    f.push('RelativeOrientationSensor:' + !!window.RelativeOrientationSensor);
-    f.push('LinearAccelerationSensor:' + !!window.LinearAccelerationSensor);
-    f.push('Accelerometer:' + !!window.Accelerometer);
-    f.push('Gyroscope:' + !!window.Gyroscope);
-    f.push('Magnetometer:' + !!window.Magnetometer);
-    f.push('DeviceMotionEvent:' + !!window.DeviceMotionEvent);
-    f.push('DeviceOrientationEvent:' + !!window.DeviceOrientationEvent);
-    statusEl.textContent = 'pronto';
-    apisEl.textContent = f.join('\n');
-  }, 200);
+// ================= Toque: override manual + reset =================
+let lastTouchX = null;
+document.body.addEventListener('touchstart', (e) => {
+  if (e.target.closest('button')) return;
+  lastTouchX = e.touches[0].clientX;
+});
+document.body.addEventListener('touchmove', (e) => {
+  if (lastTouchX === null) return;
+  const dx = e.touches[0].clientX - lastTouchX;
+  lastTouchX = e.touches[0].clientX;
+  yaw += dx * 0.006;
+  document.getElementById('modeY').textContent = 'toque (manual)';
+}, { passive: true });
+document.body.addEventListener('touchend', () => { lastTouchX = null; });
 
-})();
+document.getElementById('invertBtn').addEventListener('click', () => { invertDir *= -1; });
+document.getElementById('resetBtn').addEventListener('click', () => { yaw = 0; });
+
+// ================= Ativação / permissões =================
+document.getElementById('startBtn').addEventListener('click', async () => {
+  const needsOrientPerm = typeof DeviceOrientationEvent !== 'undefined'
+    && typeof DeviceOrientationEvent.requestPermission === 'function';
+  const needsMotionPerm = typeof DeviceMotionEvent !== 'undefined'
+    && typeof DeviceMotionEvent.requestPermission === 'function';
+  try {
+    if (needsOrientPerm) await DeviceOrientationEvent.requestPermission();
+    if (needsMotionPerm) await DeviceMotionEvent.requestPermission();
+  } catch (err) { console.warn('permissão sensor erro', err); }
+
+  window.addEventListener('deviceorientation', handleOrientation, true);
+  window.addEventListener('devicemotion', handleMotion, true);
+  await startCamera();
+
+  document.getElementById('overlay').style.display = 'none';
+});
+
+// ================= Loop =================
+function animate() {
+  requestAnimationFrame(animate);
+  cube.rotation.x += (pitch - cube.rotation.x) * 0.15;
+  cube.rotation.z += (roll - cube.rotation.z) * 0.15;
+  cube.rotation.y += (yaw - cube.rotation.y) * 0.3; // yaw responde mais rápido (já vem incremental)
+
+  document.getElementById('p').textContent = THREE.MathUtils.radToDeg(pitch).toFixed(1);
+  document.getElementById('r').textContent = THREE.MathUtils.radToDeg(roll).toFixed(1);
+  document.getElementById('y').textContent = THREE.MathUtils.radToDeg(yaw).toFixed(1);
+
+  renderer.render(scene, camera);
+}
+animate();
 </script>
 </body>
 </html>
