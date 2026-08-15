@@ -363,7 +363,23 @@ async function startCamera() {
     setInterval(opticalFlowTick, 80);
   } catch (err) {
     document.getElementById('modeY').textContent = 'câmera indisponível';
+    showCameraError(err);
   }
+}
+
+function showCameraError(err) {
+  const box = document.createElement('div');
+  box.style.cssText = 'position:fixed;inset:0;z-index:30;background:rgba(5,7,10,0.97);'
+    + 'color:#fff;display:flex;flex-direction:column;align-items:center;justify-content:center;'
+    + 'text-align:center;padding:24px;font-size:13px;line-height:1.6;';
+  box.innerHTML = '<div style="font-size:32px;margin-bottom:10px">📷🚫</div>'
+    + '<b>Câmera bloqueada pra este site</b><br>'
+    + 'Toque no ícone de cadeado ao lado do endereço → Permissões → Câmera → Permitir.<br>'
+    + 'Depois feche esta aba e abra de novo.<br>'
+    + '<span style="opacity:0.6;font-size:11px;margin-top:8px;display:block">erro técnico: ' + (err.message || err.name || err) + '</span>'
+    + '<button id="dismissCamErr" style="margin-top:16px;padding:10px 20px;border-radius:8px;border:none;background:#ffb020;color:#071018;font-weight:700">Continuar sem câmera (só cima/baixo)</button>';
+  document.body.appendChild(box);
+  document.getElementById('dismissCamErr').addEventListener('click', () => box.remove());
 }
 
 // ================= Recentralizar =================
