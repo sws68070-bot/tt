@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no, viewport-fit=cover">
-<title>Emulador de Giroscópio — VIO</title>
+<title>Emulador de Giroscópio v3</title>
 <style>
   html, body {
     margin: 0; padding: 0; overflow: hidden;
@@ -27,45 +27,58 @@
   }
 
   #hud {
-    position: fixed; top: 12px; left: 12px; color: #9fd; font-size: 12px;
-    background: rgba(0,0,0,0.4); padding: 10px 14px; border-radius: 8px;
-    font-family: monospace; line-height: 1.6; z-index: 5; pointer-events: none;
-    min-width: 165px;
+    position: fixed; top: 12px; left: 12px; color: #9fd; font-size: 11.5px;
+    background: rgba(0,0,0,0.45); padding: 10px 14px; border-radius: 10px;
+    font-family: monospace; line-height: 1.7; z-index: 5; pointer-events: none;
+    min-width: 172px; backdrop-filter: blur(4px);
   }
   #hud .mode { color: #ffb020; font-weight: 700; }
-  #hud .warn { color: #ff6b6b; }
-  #hud .ok { color: #6bffb0; }
+  #hud .dim { color: rgba(159,255,221,0.5); }
+
+  #qualityWrap {
+    margin-top: 4px; width: 100%; height: 5px; background: rgba(255,255,255,0.1);
+    border-radius: 3px; overflow: hidden;
+  }
+  #qualityBar { height: 100%; width: 0%; background: #6bffb0; transition: width 0.1s, background 0.2s; }
 
   #camPreview {
-    position: fixed; top: 12px; right: 12px; width: 90px; height: 68px;
+    position: fixed; top: 12px; right: 12px; width: 92px; height: 70px;
     border-radius: 8px; border: 2px solid rgba(255,176,32,0.6); z-index: 6;
-    object-fit: cover; opacity: 0.9;
+    object-fit: cover; opacity: 0.9; transition: opacity 0.2s;
   }
+  #camPreview.hidden { opacity: 0; pointer-events: none; }
 
   #hint {
     position: fixed; bottom: 14px; left: 14px; right: 14px;
     background: rgba(255,255,255,0.06); color: rgba(255,255,255,0.75); padding: 10px 12px;
-    border-radius: 8px; font-size: 11.5px; line-height: 1.4; z-index: 6; text-align: center;
+    border-radius: 8px; font-size: 11px; line-height: 1.4; z-index: 6; text-align: center;
   }
 
   #controls {
-    position: fixed; bottom: 90px; right: 14px; z-index: 6;
-    display: flex; flex-direction: column; gap: 6px; align-items: flex-end;
+    position: fixed; bottom: 88px; right: 14px; z-index: 6;
+    display: flex; flex-direction: column; gap: 6px; align-items: stretch; width: 150px;
   }
   #controls button {
-    padding: 9px 14px; border-radius: 8px; border: 1px solid rgba(255,255,255,0.2);
-    background: rgba(255,255,255,0.08); color: #fff; font-size: 11.5px;
+    padding: 9px 12px; border-radius: 8px; border: 1px solid rgba(255,255,255,0.2);
+    background: rgba(255,255,255,0.08); color: #fff; font-size: 11px;
   }
+  #controls button.active { background: #ffb020; color: #071018; border-color: #ffb020; font-weight: 700; }
+  #sensWrap {
+    background: rgba(255,255,255,0.06); border-radius: 8px; padding: 8px 10px;
+    color: #fff; font-size: 10.5px;
+  }
+  #sensWrap input { width: 100%; margin-top: 4px; }
 </style>
 </head>
 <body>
 
 <div id="hud">
-  modo cima/baixo: <span class="mode" id="modePR">-</span><br>
-  modo esquerda/direita: <span class="mode" id="modeY">-</span><br>
-  rastreio: <span id="trackStatus">-</span><br>
+  cima/baixo: <span class="mode" id="modePR">-</span><br>
+  esquerda/direita: <span class="mode" id="modeY">-</span><br>
+  <span class="dim" id="perfLine">- ms · - fps</span><br>
   cima/baixo: <span id="p">0.0</span>°<br>
   esquerda/direita: <span id="y">0.0</span>°
+  <div id="qualityWrap"><div id="qualityBar"></div></div>
 </div>
 
 <video id="camPreview" playsinline autoplay muted></video>
@@ -73,19 +86,24 @@
 <div id="controls">
   <button id="invertBtn">Inverter direção</button>
   <button id="resetBtn">Recentralizar cubo</button>
+  <button id="camToggleBtn">Esconder câmera</button>
+  <div id="sensWrap">
+    sensibilidade: <span id="sensVal">1.0x</span>
+    <input type="range" id="sensSlider" min="0.4" max="2.5" step="0.1" value="1.0">
+  </div>
 </div>
 
 <div id="hint">
-  Yaw vem da câmera (fluxo ótico) — aponte pra algo com textura/detalhe e boa luz.
-  Se perder rastreio, arraste o dedo pra girar manualmente.
+  Esquerda/direita vem da câmera. Aponte pra algo com detalhe e boa luz.
+  Cima/baixo vem do sensor de movimento do celular.
 </div>
 
 <div id="overlay">
-  <h2>Emulador de Giroscópio — VIO</h2>
+  <h2>Emulador de Giroscópio v3</h2>
   <p>
-    Combina acelerômetro (inclinação) + câmera (rastreio visual de pontos pra
-    estimar giro horizontal) — o mesmo princípio usado em AR, só que
-    simplificado. Precisa de permissão de câmera e movimento.
+    Rastreamento em duas etapas (grosseira + refinada) pra maior alcance e
+    precisão, suavização por confiança, tela sempre acesa durante o uso.
+    Precisa de permissão de câmera e movimento.
   </p>
   <button id="startBtn">Ativar</button>
 </div>
@@ -95,20 +113,50 @@
 // ================= Cena Three.js =================
 const scene = new THREE.Scene();
 const camera = new THREE.PerspectiveCamera(60, innerWidth/innerHeight, 0.1, 100);
-camera.position.z = 4;
+camera.position.set(0, 0.6, 4.2);
+camera.lookAt(0, 0, 0);
 
 const renderer = new THREE.WebGLRenderer({ antialias: true });
 renderer.setSize(innerWidth, innerHeight);
-renderer.setPixelRatio(devicePixelRatio);
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
 document.body.appendChild(renderer.domElement);
 
-scene.add(new THREE.AmbientLight(0x808080));
-const dirLight = new THREE.DirectionalLight(0xffffff, 1);
-dirLight.position.set(3, 5, 4);
-scene.add(dirLight);
+scene.add(new THREE.AmbientLight(0xffffff, 0.55));
+const keyLight = new THREE.DirectionalLight(0xffffff, 0.9);
+keyLight.position.set(3, 5, 4);
+scene.add(keyLight);
+const rimLight = new THREE.DirectionalLight(0x88aaff, 0.4);
+rimLight.position.set(-4, -2, -3);
+scene.add(rimLight);
 
-const colors = [0xff4f4f, 0x4fff88, 0x4f8cff, 0xffe14f, 0xff4fe1, 0x4ffff2];
-const materials = colors.map(c => new THREE.MeshStandardMaterial({ color: c }));
+// Chão em grade — referência espacial pra perceber a rotação melhor
+const grid = new THREE.GridHelper(10, 20, 0x2a3a4a, 0x151f28);
+grid.position.y = -1.3;
+scene.add(grid);
+
+// Cubo com rótulo de letra em cada face (facilita perceber a rotação)
+function makeFaceTexture(label, bg) {
+  const c = document.createElement('canvas');
+  c.width = 256; c.height = 256;
+  const ctx = c.getContext('2d');
+  ctx.fillStyle = bg; ctx.fillRect(0, 0, 256, 256);
+  ctx.strokeStyle = 'rgba(0,0,0,0.35)'; ctx.lineWidth = 10;
+  ctx.strokeRect(5, 5, 246, 246);
+  ctx.fillStyle = 'rgba(0,0,0,0.75)';
+  ctx.font = 'bold 120px system-ui, sans-serif';
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.fillText(label, 128, 138);
+  return new THREE.CanvasTexture(c);
+}
+const faceDefs = [
+  { l: 'D', c: '#ff4f4f' }, // direita
+  { l: 'E', c: '#4fff88' }, // esquerda
+  { l: '↑', c: '#4f8cff' }, // cima
+  { l: '↓', c: '#ffe14f' }, // baixo
+  { l: 'F', c: '#ff4fe1' }, // frente
+  { l: 'T', c: '#4ffff2' }, // trás
+];
+const materials = faceDefs.map(f => new THREE.MeshStandardMaterial({ map: makeFaceTexture(f.l, f.c) }));
 const geometry = new THREE.BoxGeometry(1.6, 1.6, 1.6);
 const cube = new THREE.Mesh(geometry, materials);
 scene.add(cube);
@@ -121,11 +169,26 @@ addEventListener('resize', () => {
   renderer.setSize(innerWidth, innerHeight);
 });
 
+// ================= Configurações persistentes =================
+const saved = JSON.parse(localStorage.getItem('gyroEmuSettings') || '{}');
+let invertDir = saved.invertDir || 1;
+let sensitivity = saved.sensitivity || 1.0;
+function saveSettings() {
+  localStorage.setItem('gyroEmuSettings', JSON.stringify({ invertDir, sensitivity }));
+}
+
+const sensSlider = document.getElementById('sensSlider');
+sensSlider.value = sensitivity;
+document.getElementById('sensVal').textContent = sensitivity.toFixed(1) + 'x';
+sensSlider.addEventListener('input', () => {
+  sensitivity = parseFloat(sensSlider.value);
+  document.getElementById('sensVal').textContent = sensitivity.toFixed(1) + 'x';
+  saveSettings();
+});
+
 // ================= Estado de rotação =================
-// Só 2 eixos: pitch (cima/baixo, via sensor) e yaw (esquerda/direita, via câmera).
-// Roll (inclinar de lado) foi removido de propósito.
 let pitch = 0, yaw = 0;
-let pitchOffset = 0;   // calibração: "zero" = posição em que o celular estava ao recentralizar
+let pitchOffset = 0;
 let rawPitch = 0;
 document.getElementById('modePR').textContent = 'aguardando';
 document.getElementById('modeY').textContent = 'aguardando';
@@ -138,7 +201,6 @@ let orientationGaveRealBeta = false;
 function handleMotion(e) {
   const g = e.accelerationIncludingGravity;
   if (!g || typeof g.x !== 'number' || orientationGaveRealBeta) return;
-
   if (accelFirst) { fx=g.x; fy=g.y; fz=g.z; accelFirst=false; }
   else {
     fx += (g.x - fx) * ALPHA_LP;
@@ -150,7 +212,6 @@ function handleMotion(e) {
   document.getElementById('modePR').textContent = 'acelerômetro';
 }
 
-// Se por acaso o giroscópio real existir, usamos ele só pro pitch (ignoramos beta/gamma como roll)
 function handleOrientation(e) {
   if (typeof e.beta === 'number') {
     orientationGaveRealBeta = true;
@@ -164,68 +225,98 @@ function handleOrientation(e) {
   }
 }
 
-// ================= Câmera -> fluxo ótico (yaw) =================
-const W = 48, H = 36;       // resolução reduzida pro block matching
-const MAX_SHIFT = 8;         // busca de até 8px em cada direção
-const FOV_H_DEG = 60;        // campo de visão horizontal aproximado
-const DEG_PER_PIXEL = FOV_H_DEG / W;
-const NOISE_SCORE_LIMIT = 14; // acima disso, consideramos "sem textura suficiente"
+// ================= Câmera -> fluxo ótico em pirâmide (yaw) =================
+// Etapa 1 (grosseira): resolução bem baixa, busca ampla -> acha a região certa.
+// Etapa 2 (fina): resolução maior, busca pequena ao redor do resultado grosseiro
+// -> refina sem custo de uma busca ampla na resolução alta.
+const COARSE_W = 24, COARSE_H = 18, COARSE_RANGE = 10;
+const FINE_W = 48, FINE_H = 36, FINE_RANGE = 3;
+const FOV_H_DEG = 60;
+const DEG_PER_PIXEL_FINE = FOV_H_DEG / FINE_W;
+const NOISE_SCORE_LIMIT = 16; // acima disso, confiança = 0
 
 let cameraActive = false;
-let invertDir = 1;
 const videoEl = document.getElementById('camPreview');
-const sampleCanvas = document.createElement('canvas');
-sampleCanvas.width = W; sampleCanvas.height = H;
-const sampleCtx = sampleCanvas.getContext('2d', { willReadFrequently: true });
-let prevGray = null;
 
-function grabGray() {
-  sampleCtx.drawImage(videoEl, 0, 0, W, H);
-  const data = sampleCtx.getImageData(0, 0, W, H).data;
-  const gray = new Float32Array(W * H);
-  for (let i = 0; i < W * H; i++) {
+const coarseCanvas = document.createElement('canvas');
+coarseCanvas.width = COARSE_W; coarseCanvas.height = COARSE_H;
+const coarseCtx = coarseCanvas.getContext('2d', { willReadFrequently: true });
+
+const fineCanvas = document.createElement('canvas');
+fineCanvas.width = FINE_W; fineCanvas.height = FINE_H;
+const fineCtx = fineCanvas.getContext('2d', { willReadFrequently: true });
+
+let prevCoarse = null, prevFine = null;
+
+function toGray(ctx, w, h) {
+  const data = ctx.getImageData(0, 0, w, h).data;
+  const gray = new Float32Array(w * h);
+  for (let i = 0; i < w * h; i++) {
     gray[i] = 0.299*data[i*4] + 0.587*data[i*4+1] + 0.114*data[i*4+2];
   }
   return gray;
 }
 
-function estimateShiftX(prev, curr) {
-  let bestDx = 0, bestScore = Infinity;
-  for (let dx = -MAX_SHIFT; dx <= MAX_SHIFT; dx++) {
+function bestShiftX(prev, curr, w, h, center, range) {
+  let bestDx = center, bestScore = Infinity;
+  const lo = center - range, hi = center + range;
+  for (let dx = lo; dx <= hi; dx++) {
     let sad = 0, count = 0;
-    for (let yy = 4; yy < H - 4; yy++) {
-      for (let xx = 4; xx < W - 4; xx++) {
+    for (let yy = 3; yy < h - 3; yy++) {
+      for (let xx = 3; xx < w - 3; xx++) {
         const sx = xx + dx;
-        if (sx < 0 || sx >= W) continue;
-        sad += Math.abs(curr[yy*W + xx] - prev[yy*W + sx]);
+        if (sx < 0 || sx >= w) continue;
+        sad += Math.abs(curr[yy*w + xx] - prev[yy*w + sx]);
         count++;
       }
     }
+    if (count === 0) continue;
     const score = sad / count;
     if (score < bestScore) { bestScore = score; bestDx = dx; }
   }
   return { dx: bestDx, score: bestScore };
 }
 
+let lastTickTime = performance.now();
+let perfMs = 0, perfFps = 0;
+
 function opticalFlowTick() {
   if (!cameraActive) return;
-  const curr = grabGray();
-  if (prevGray) {
-    const { dx, score } = estimateShiftX(prevGray, curr);
-    const statusEl = document.getElementById('trackStatus');
-    if (score < NOISE_SCORE_LIMIT) {
-      // pontos da cena moveram dx pixels -> dispositivo girou na direção oposta
-      const deltaDeg = -dx * DEG_PER_PIXEL * invertDir;
-      yaw += THREE.MathUtils.degToRad(deltaDeg);
-      statusEl.textContent = 'rastreando';
-      statusEl.className = 'ok';
+  const t0 = performance.now();
+
+  coarseCtx.drawImage(videoEl, 0, 0, COARSE_W, COARSE_H);
+  const currCoarse = toGray(coarseCtx, COARSE_W, COARSE_H);
+  fineCtx.drawImage(videoEl, 0, 0, FINE_W, FINE_H);
+  const currFine = toGray(fineCtx, FINE_W, FINE_H);
+
+  if (prevCoarse && prevFine) {
+    // Etapa grosseira: acha direção aproximada com busca ampla, resolução baixa
+    const coarse = bestShiftX(prevCoarse, currCoarse, COARSE_W, COARSE_H, 0, COARSE_RANGE);
+    // Etapa fina: converte a estimativa grosseira pra escala fina e refina
+    const coarseInFineScale = Math.round(coarse.dx * (FINE_W / COARSE_W));
+    const fine = bestShiftX(prevFine, currFine, FINE_W, FINE_H, coarseInFineScale, FINE_RANGE);
+
+    const confidence = Math.max(0, 1 - fine.score / NOISE_SCORE_LIMIT);
+    const qualityBar = document.getElementById('qualityBar');
+    qualityBar.style.width = (confidence * 100).toFixed(0) + '%';
+    qualityBar.style.background = confidence > 0.5 ? '#6bffb0' : confidence > 0.2 ? '#ffcf4f' : '#ff6b6b';
+
+    if (confidence > 0.12) {
+      const deltaDeg = -fine.dx * DEG_PER_PIXEL_FINE * invertDir * sensitivity;
+      // suaviza mais quando a confiança é baixa, pra não "pular" com ruído
+      yaw += THREE.MathUtils.degToRad(deltaDeg) * (0.4 + 0.6 * confidence);
       document.getElementById('modeY').textContent = 'câmera';
-    } else {
-      statusEl.textContent = 'sem textura/luz';
-      statusEl.className = 'warn';
     }
   }
-  prevGray = curr;
+
+  prevCoarse = currCoarse;
+  prevFine = currFine;
+
+  const t1 = performance.now();
+  perfMs = perfMs * 0.8 + (t1 - t0) * 0.2;
+  perfFps = perfFps * 0.8 + (1000 / Math.max(1, t1 - lastTickTime)) * 0.2;
+  lastTickTime = t1;
+  document.getElementById('perfLine').textContent = `${perfMs.toFixed(1)} ms · ${perfFps.toFixed(0)} fps`;
 }
 
 async function startCamera() {
@@ -236,34 +327,56 @@ async function startCamera() {
     videoEl.srcObject = stream;
     await videoEl.play();
     cameraActive = true;
-    setInterval(opticalFlowTick, 80); // ~12x por segundo, leve o suficiente
+    setInterval(opticalFlowTick, 70);
   } catch (err) {
-    document.getElementById('trackStatus').textContent = 'câmera negada';
-    document.getElementById('trackStatus').className = 'warn';
-    document.getElementById('modeY').textContent = 'toque (sem câmera)';
+    document.getElementById('modeY').textContent = 'toque (câmera negada)';
   }
 }
 
-// ================= Toque: override manual + reset =================
+// ================= Toque: override manual do yaw =================
 let lastTouchX = null;
 document.body.addEventListener('touchstart', (e) => {
-  if (e.target.closest('button')) return;
+  if (e.target.closest('button') || e.target.closest('#sensWrap')) return;
   lastTouchX = e.touches[0].clientX;
 });
 document.body.addEventListener('touchmove', (e) => {
   if (lastTouchX === null) return;
   const dx = e.touches[0].clientX - lastTouchX;
   lastTouchX = e.touches[0].clientX;
-  yaw += dx * 0.006;
+  yaw += dx * 0.006 * sensitivity;
   document.getElementById('modeY').textContent = 'toque (manual)';
 }, { passive: true });
 document.body.addEventListener('touchend', () => { lastTouchX = null; });
 
-document.getElementById('invertBtn').addEventListener('click', () => { invertDir *= -1; });
+// ================= Botões =================
+document.getElementById('invertBtn').addEventListener('click', (e) => {
+  invertDir *= -1;
+  e.target.classList.toggle('active', invertDir === -1);
+  saveSettings();
+});
+if (invertDir === -1) document.getElementById('invertBtn').classList.add('active');
+
 document.getElementById('resetBtn').addEventListener('click', () => {
   yaw = 0;
-  pitchOffset = rawPitch; // a posição atual do celular vira o novo "centro" (0°)
+  pitchOffset = rawPitch;
   pitch = 0;
+  if (navigator.vibrate) navigator.vibrate(30);
+});
+
+document.getElementById('camToggleBtn').addEventListener('click', (e) => {
+  const hidden = videoEl.classList.toggle('hidden');
+  e.target.textContent = hidden ? 'Mostrar câmera' : 'Esconder câmera';
+});
+
+// ================= Wake Lock: mantém a tela acesa durante o uso =================
+let wakeLock = null;
+async function requestWakeLock() {
+  try {
+    if ('wakeLock' in navigator) wakeLock = await navigator.wakeLock.request('screen');
+  } catch (err) { /* silencioso — alguns navegadores negam, sem problema */ }
+}
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible' && cameraActive) requestWakeLock();
 });
 
 // ================= Ativação / permissões =================
@@ -280,16 +393,17 @@ document.getElementById('startBtn').addEventListener('click', async () => {
   window.addEventListener('deviceorientation', handleOrientation, true);
   window.addEventListener('devicemotion', handleMotion, true);
   await startCamera();
+  await requestWakeLock();
 
   document.getElementById('overlay').style.display = 'none';
 });
 
-// ================= Loop =================
+// ================= Loop de renderização =================
 function animate() {
   requestAnimationFrame(animate);
   cube.rotation.x += (pitch - cube.rotation.x) * 0.15;
-  cube.rotation.z = 0; // roll removido de propósito — sem inclinação lateral
-  cube.rotation.y += (yaw - cube.rotation.y) * 0.3; // yaw responde mais rápido (já vem incremental)
+  cube.rotation.z = 0;
+  cube.rotation.y += (yaw - cube.rotation.y) * 0.35;
 
   document.getElementById('p').textContent = THREE.MathUtils.radToDeg(pitch).toFixed(1);
   document.getElementById('y').textContent = THREE.MathUtils.radToDeg(yaw).toFixed(1);
