@@ -253,6 +253,13 @@ let cameraActive = false;
 const videoEl = document.createElement('video');
 videoEl.playsInline = true; videoEl.muted = true;
 
+// Detecção de "realmente parado" agora vem da própria câmera, não do
+// acelerômetro — girar só no eixo horizontal (yaw) quase não muda a leitura
+// de gravidade, então usar o acelerômetro pra isso travava o yaw por engano.
+const DX_HISTORY_SIZE = 12;
+let dxHistory = [];
+const CAMERA_STILL_DX_LIMIT = 1.1; // px
+
 const coarseCanvas = document.createElement('canvas');
 coarseCanvas.width = COARSE_W; coarseCanvas.height = COARSE_H;
 const coarseCtx = coarseCanvas.getContext('2d', { willReadFrequently: true });
@@ -313,16 +320,25 @@ function opticalFlowTick() {
     const agreement = Math.max(0, 1 - verticalDiff / AGREEMENT_TOLERANCE_PX);
     prevRawPitchAtTick = rawPitch;
 
-    const stillEl = document.getElementById('stillState');
-    stillEl.textContent = isStill ? 'parado' : 'movendo';
+    // Histórico do deslocamento horizontal medido pela câmera: só consideramos
+    // "parado de verdade" quando o próprio movimento visual fica perto de zero
+    // de forma consistente — não quando o acelerômetro acha que está parado
+    // (que também acontece durante um giro horizontal puro).
+    dxHistory.push(fine.dx);
+    if (dxHistory.length > DX_HISTORY_SIZE) dxHistory.shift();
+    const avgAbsDx = dxHistory.reduce((a,b)=>a+Math.abs(b),0) / dxHistory.length;
+    const cameraStill = dxHistory.length === DX_HISTORY_SIZE && avgAbsDx < CAMERA_STILL_DX_LIMIT;
 
-    const stillnessFactor = isStill ? 0.03 : 1;
+    const stillEl = document.getElementById('stillState');
+    stillEl.textContent = cameraStill ? 'parado' : 'movendo';
+
+    const stillnessFactor = cameraStill ? 0.15 : 1;
     const trust = confidence * (0.5 + 0.5*agreement) * stillnessFactor;
 
     if (trust > 0.08) {
       const deltaDeg = -fine.dx * DEG_PER_PIXEL_X;
       yaw += THREE.MathUtils.degToRad(deltaDeg) * trust;
-      if (!isStill) document.getElementById('modeY').textContent = 'câmera+acel';
+      if (!cameraStill) document.getElementById('modeY').textContent = 'câmera+acel';
     }
   }
   prevCoarse = currCoarse;
@@ -390,7 +406,10 @@ function exitVrMode() {
 
 document.getElementById('exitVrBtn').addEventListener('click', exitVrMode);
 
-document.getElementById('startBtn').addEventListener('click', async () => {
+let sensorsStarted = false;
+
+async function startSensors() {
+  if (sensorsStarted) return;
   const needsOrientPerm = typeof DeviceOrientationEvent !== 'undefined'
     && typeof DeviceOrientationEvent.requestPermission === 'function';
   const needsMotionPerm = typeof DeviceMotionEvent !== 'undefined'
@@ -404,10 +423,18 @@ document.getElementById('startBtn').addEventListener('click', async () => {
   window.addEventListener('devicemotion', handleMotion, true);
   await startCamera();
   await requestWakeLock();
+  sensorsStarted = true;
+}
+
+document.getElementById('startBtn').addEventListener('click', async () => {
+  await startSensors();
   document.getElementById('overlay').style.display = 'none';
 });
 
-document.getElementById('vrBtn').addEventListener('click', enterVrMode);
+document.getElementById('vrBtn').addEventListener('click', async () => {
+  await startSensors(); // garante que os sensores estejam ativos mesmo se pulou o outro botão
+  await enterVrMode();
+});
 
 // ================= Loop =================
 function animate() {
