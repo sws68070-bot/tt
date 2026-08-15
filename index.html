@@ -59,6 +59,13 @@
     padding: 7px 10px; border-radius: 6px; border: 1px solid rgba(255,255,255,0.2);
     background: rgba(255,255,255,0.08); color: #fff; font-size: 10px;
   }
+
+  #camPreview {
+    position: fixed; bottom: 8px; left: 8px; width: 96px; height: 72px;
+    border-radius: 8px; border: 2px solid rgba(255,176,32,0.6); z-index: 6;
+    object-fit: cover; opacity: 0.95; transition: opacity 0.2s;
+  }
+  #camPreview.hidden { opacity: 0; pointer-events: none; }
 </style>
 </head>
 <body>
@@ -68,6 +75,7 @@
   <span id="modeY">-</span> · <span id="stillState">-</span>
 </div>
 <div id="reticle"></div>
+<video id="camPreview" playsinline autoplay muted></video>
 <div id="eyeDivider"></div>
 
 <div id="topControls">
@@ -250,8 +258,7 @@ const NOISE_SCORE_LIMIT = 16;
 const AGREEMENT_TOLERANCE_PX = 3.5;
 
 let cameraActive = false;
-const videoEl = document.createElement('video');
-videoEl.playsInline = true; videoEl.muted = true;
+const videoEl = document.getElementById('camPreview');
 
 // Detecção de "realmente parado" agora vem da própria câmera, não do
 // acelerômetro — girar só no eixo horizontal (yaw) quase não muda a leitura
@@ -389,6 +396,7 @@ async function enterVrMode() {
   document.getElementById('reticle').style.display = 'block';
   document.getElementById('exitVrBtn').style.display = 'inline-block';
   document.getElementById('overlay').style.display = 'none';
+  document.getElementById('camPreview').classList.add('hidden');
   rotateHint.classList.add('armed');
   resize();
 }
@@ -400,6 +408,7 @@ function exitVrMode() {
   document.getElementById('eyeDivider').style.display = 'none';
   document.getElementById('reticle').style.display = 'none';
   document.getElementById('exitVrBtn').style.display = 'none';
+  document.getElementById('camPreview').classList.remove('hidden');
   rotateHint.classList.remove('armed');
   resize();
 }
