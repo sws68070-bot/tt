@@ -1,368 +1,323 @@
 <!DOCTYPE html>
 <html lang="pt-BR">
 <head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
-<title>DEPTH // cubo ancorado</title>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Sensor Lab — DEPTH</title>
 <style>
-  @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Inter:wght@400;500;600;700&display=swap');
-
-  :root{
-    --bg:#05070a;
-    --glass: rgba(8,12,16,0.55);
-    --line: rgba(255,255,255,0.14);
-    --signal:#ffb020;
-    --signal-dim: rgba(255,176,32,0.35);
-    --ok:#5eead4;
-    --text:#eef1f3;
-    --text-dim: rgba(238,241,243,0.55);
-  }
-
-  *{box-sizing:border-box; -webkit-tap-highlight-color:transparent;}
-  html,body{margin:0; height:100%; overflow:hidden; background:var(--bg); color:var(--text);
-    font-family:'Inter',system-ui,sans-serif;}
-
-  #camera{
-    position:fixed; inset:0; width:100%; height:100%;
-    object-fit:cover; z-index:0; background:#000;
-    filter:saturate(0.92) contrast(1.03);
-  }
-
-  #scene{
-    position:fixed; inset:0; width:100%; height:100%; z-index:1;
-  }
-
-  #vignette{
-    position:fixed; inset:0; z-index:2; pointer-events:none;
-    background: radial-gradient(120% 90% at 50% 50%, transparent 45%, rgba(0,0,0,0.55) 100%);
-  }
-
-  .scanlines{
-    position:fixed; inset:0; z-index:2; pointer-events:none; opacity:0.05;
-    background:repeating-linear-gradient(0deg, #fff 0px, #fff 1px, transparent 1px, transparent 3px);
-    mix-blend-mode:overlay;
-  }
-
-  .hud{ position:fixed; z-index:5; pointer-events:none; }
-
-  .corner{ position:fixed; width:22px; height:22px; border-color:var(--signal-dim); z-index:5; opacity:0.9; pointer-events:none;}
-  .corner.tl{ top:16px; left:16px; border-top:2px solid var(--signal); border-left:2px solid var(--signal); }
-  .corner.tr{ top:16px; right:16px; border-top:2px solid var(--signal); border-right:2px solid var(--signal); }
-  .corner.bl{ bottom:16px; left:16px; border-bottom:2px solid var(--signal); border-left:2px solid var(--signal); }
-  .corner.br{ bottom:16px; right:16px; border-bottom:2px solid var(--signal); border-right:2px solid var(--signal); }
-
-  .brand{ top:20px; left:44px; font-family:'IBM Plex Mono', monospace; font-size:12px; letter-spacing:0.18em; color:var(--text-dim); text-transform:uppercase; }
-  .brand b{ color:var(--signal); font-weight:600; }
-
-  .clock{ top:20px; right:44px; font-family:'IBM Plex Mono', monospace; font-size:12px; letter-spacing:0.1em; color:var(--text-dim); text-align:right; }
-
-  .readout{
-    bottom:52px; left:44px; font-family:'IBM Plex Mono', monospace;
-    display:flex; flex-direction:column; gap:10px;
-    background:var(--glass); backdrop-filter: blur(10px);
-    border:1px solid var(--line); border-radius:4px;
-    padding:14px 18px; min-width:200px;
-  }
-  .readout .row{ display:flex; justify-content:space-between; gap:18px; font-size:12px; }
-  .readout .label{ color:var(--text-dim); letter-spacing:0.08em; }
-  .readout .val{ color:var(--signal); font-weight:600; }
-  .readout .val.ok{ color:var(--ok); }
-
-  .bar-wrap{ width:100%; height:3px; background:rgba(255,255,255,0.12); border-radius:2px; margin-top:2px; overflow:hidden;}
-  .bar{ height:100%; width:0%; background:var(--signal); transition:width 0.15s linear; }
-
-  .caption{ bottom:52px; right:44px; max-width:220px; text-align:right; font-size:12px; line-height:1.5; color:var(--text-dim); }
-  .caption b{ color:var(--text); font-weight:600; }
-
-  #placeBtn{
-    position:fixed; z-index:6; bottom:150px; left:50%; transform:translateX(-50%);
-    appearance:none; border:1px solid var(--signal); background:var(--signal-dim);
-    color:var(--text); font-family:'Inter',sans-serif; font-weight:600; font-size:13px;
-    padding:11px 22px; border-radius:999px; cursor:pointer; letter-spacing:0.02em;
-  }
-  #placeBtn:active{ transform:translateX(-50%) scale(0.96); }
-
-  #gate{
-    position:fixed; inset:0; z-index:10; display:flex; align-items:center; justify-content:center;
-    background:radial-gradient(120% 120% at 50% 20%, #10151b 0%, #05070a 70%);
-    padding:24px;
-  }
-  #gate .panel{
-    max-width:430px; width:100%; text-align:center;
-    border:1px solid var(--line); border-radius:6px; padding:36px 28px;
-    background:var(--glass); backdrop-filter: blur(6px);
-  }
-  #gate .eyebrow{ font-family:'IBM Plex Mono', monospace; font-size:11px; letter-spacing:0.22em; color:var(--signal); text-transform:uppercase; margin-bottom:14px; }
-  #gate h1{ font-size:25px; line-height:1.25; margin:0 0 12px; font-weight:700; letter-spacing:-0.01em; }
-  #gate p{ font-size:14px; color:var(--text-dim); line-height:1.6; margin:0 0 26px; }
-  #gate button{
-    appearance:none; border:1px solid var(--signal); background:var(--signal-dim);
-    color:var(--text); font-family:'Inter',sans-serif; font-weight:600; font-size:14px;
-    padding:13px 26px; border-radius:4px; cursor:pointer; letter-spacing:0.02em;
-    transition:background 0.15s, transform 0.1s; width:100%;
-  }
-  #gate button:active{ transform:scale(0.98); }
-  #gate button:hover{ background:rgba(255,176,32,0.5); }
-  #gate .fine{ margin-top:16px; font-size:11px; color:var(--text-dim); font-family:'IBM Plex Mono',monospace; }
-  #gate .err{ margin-top:14px; font-size:12px; color:#ff6b6b; display:none; text-align:left; }
-
-  @media (max-width:520px){
-    .brand{ left:38px; }
-    .clock{ right:38px; }
-    .readout{ left:16px; right:16px; bottom:150px; min-width:0; }
-    .caption{ display:none; }
-    #placeBtn{ bottom:250px; }
-  }
-
-  @media (prefers-reduced-motion: reduce){ .bar{ transition:none; } }
+  :root{ --bg:#05070a; --card:#0b1116; --accent:#ffb020; --text:#e8eef2; }
+  *{box-sizing:border-box}
+  body{margin:0; font-family:Inter,system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial; background:linear-gradient(180deg,#040608 0%,#071018 100%); color:var(--text); min-height:100vh;}
+  header{padding:18px 20px; display:flex; align-items:center; gap:12px}
+  h1{font-size:18px;margin:0}
+  p.lead{margin:6px 0 0; color:rgba(232,238,242,0.7); font-size:13px}
+  main{padding:18px; display:grid; grid-template-columns:1fr 360px; gap:18px}
+  .card{background:rgba(255,255,255,0.02); border:1px solid rgba(255,255,255,0.04); padding:14px; border-radius:8px}
+  .controls{display:flex; gap:10px}
+  button{background:var(--accent); border:none; color:#071018; padding:10px 12px; border-radius:6px; font-weight:600; cursor:pointer}
+  button.ghost{background:transparent; border:1px solid rgba(255,255,255,0.06); color:var(--text)}
+  .grid{display:grid; grid-template-columns:1fr 1fr; gap:10px}
+  .sensor{padding:10px; background:rgba(255,255,255,0.01); border-radius:6px; font-family:monospace; font-size:13px}
+  .label{font-size:12px; color:rgba(232,238,242,0.6)}
+  .val{font-size:15px; color:var(--accent); font-weight:700}
+  .small{font-size:12px; color:rgba(232,238,242,0.6)}
+  #log{height:220px; overflow:auto; background:rgba(0,0,0,0.12); padding:8px; border-radius:6px; font-family:monospace; font-size:12px}
+  footer{padding:12px 18px; font-size:12px; color:rgba(232,238,242,0.6)}
+  @media(max-width:880px){ main{grid-template-columns:1fr; } }
 </style>
 </head>
 <body>
-
-<video id="camera" autoplay playsinline muted></video>
-<canvas id="scene"></canvas>
-<div class="vignette" id="vignette"></div>
-<div class="scanlines"></div>
-
-<div class="corner tl"></div>
-<div class="corner tr"></div>
-<div class="corner bl"></div>
-<div class="corner br"></div>
-
-<div class="hud brand">DEPTH <b>// cubo v2</b></div>
-<div class="hud clock" id="clock">--:--:--</div>
-
-<div class="hud readout">
-  <div class="row"><span class="label">PASSOS</span><span class="val" id="steps">0</span></div>
-  <div class="row"><span class="label">DISTÂNCIA DO CUBO</span><span class="val" id="dist">0.0 m</span></div>
-  <div class="row"><span class="label">RUMO</span><span class="val ok" id="tilt">0°</span></div>
-  <div class="bar-wrap"><div class="bar" id="bar"></div></div>
-</div>
-
-<div class="hud caption">
-  O cubo fica <b>fixo no espaço</b>, onde você o colocar.<br>
-  Ande e ele fica para trás — <b>você se afasta dele</b>, não o contrário.<br>
-  Vire o celular para olhar em outra direção.
-</div>
-
-<button id="placeBtn">Colocar cubo aqui na sua frente</button>
-
-<div id="gate">
-  <div class="panel">
-    <div class="eyebrow">Sensor + Câmera</div>
-    <h1>Um cubo que fica parado no mundo real</h1>
-    <p>A câmera vira o fundo, e dois sensores — acelerômetro (seus passos) e giroscópio/bússola (para onde você aponta o celular) — ancoram um cubo num ponto fixo à sua frente. Ande e ele fica para trás, como se estivesse mesmo ali.</p>
-    <button id="startBtn">Ativar câmera e sensores</button>
-    <div class="err" id="err"></div>
-    <div class="fine">Precisa de HTTPS. Funciona melhor num smartphone, andando ao ar livre.</div>
+<header>
+  <div>
+    <h1>Sensor Lab — DEPTH</h1>
+    <p class="lead">Visualizador de sensores do celular — acelerômetro, giroscópio, magnetômetro, orientação absoluta e eventos legacy.</p>
   </div>
-</div>
+</header>
+<main>
+  <section class="card">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+      <div class="small">Clique em <b>Iniciar</b> num smartphone (em HTTPS) para ativar sensores.</div>
+      <div class="controls">
+        <button id="startBtn">Iniciar</button>
+        <button id="stopBtn" class="ghost">Parar</button>
+      </div>
+    </div>
 
-<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <div class="grid">
+      <div class="sensor">
+        <div class="label">Acelerômetro (linear)</div>
+        <div class="val" id="accel">—</div>
+      </div>
+
+      <div class="sensor">
+        <div class="label">Aceleração (incl. gravidade)</div>
+        <div class="val" id="accelG">—</div>
+      </div>
+
+      <div class="sensor">
+        <div class="label">Giro / Giroscópio (º/s)</div>
+        <div class="val" id="gyro">—</div>
+      </div>
+
+      <div class="sensor">
+        <div class="label">Orientação (alpha, beta, gamma)</div>
+        <div class="val" id="orientation">—</div>
+      </div>
+
+      <div class="sensor">
+        <div class="label">Magnetômetro</div>
+        <div class="val" id="mag">—</div>
+      </div>
+
+      <div class="sensor">
+        <div class="label">Quaternion / orientação absoluta</div>
+        <div class="val" id="quat">—</div>
+      </div>
+    </div>
+
+    <hr style="margin:12px 0;border:none;border-top:1px solid rgba(255,255,255,0.04)">
+
+    <div style="display:flex;gap:12px;flex-wrap:wrap">
+      <div style="flex:1">
+        <div class="label">Status das APIs</div>
+        <div id="status" class="small" style="margin-top:6px"></div>
+      </div>
+      <div style="width:220px">
+        <div class="label">Permissões</div>
+        <div id="perms" class="small" style="margin-top:6px"></div>
+      </div>
+    </div>
+
+    <div style="margin-top:12px">
+      <div class="label">Log / Erros</div>
+      <div id="log"></div>
+    </div>
+  </section>
+
+  <aside class="card">
+    <div style="margin-bottom:12px"><strong>Diagnóstico</strong></div>
+    <div class="small" style="margin-bottom:8px">APIs detectadas:</div>
+    <div id="apis" class="small" style="margin-bottom:12px"></div>
+
+    <div class="small" style="margin-bottom:8px">Câmera (prévia) — opcional:</div>
+    <video id="cam" playsinline autoplay muted style="width:100%;border-radius:6px;background:#000"></video>
+
+    <div style="margin-top:12px" class="small">Instruções rápidas:</div>
+    <ul class="small">
+      <li>O site precisa rodar em HTTPS (ou localhost).</li>
+      <li>No iOS Safari, permita acesso a movimento e orientação quando solicitado.</li>
+      <li>Se não aparecer nada, verifique permissões do site nas configurações do navegador.</li>
+    </ul>
+  </aside>
+</main>
+
+<footer>
+  Deploy automático: este arquivo foi adicionado ao repositório para teste de sensores.
+</footer>
+
 <script>
 (function(){
-  "use strict";
-
-  const gate = document.getElementById('gate');
   const startBtn = document.getElementById('startBtn');
-  const errEl = document.getElementById('err');
-  const video = document.getElementById('camera');
-  const clockEl = document.getElementById('clock');
-  const stepsEl = document.getElementById('steps');
-  const distEl = document.getElementById('dist');
-  const tiltEl = document.getElementById('tilt');
-  const barEl = document.getElementById('bar');
-  const placeBtn = document.getElementById('placeBtn');
+  const stopBtn = document.getElementById('stopBtn');
+  const logEl = document.getElementById('log');
+  const statusEl = document.getElementById('status');
+  const permsEl = document.getElementById('perms');
+  const apisEl = document.getElementById('apis');
 
-  function tickClock(){
-    clockEl.textContent = new Date().toLocaleTimeString('pt-BR', {hour12:false});
-  }
-  setInterval(tickClock, 1000);
-  tickClock();
+  const accelEl = document.getElementById('accel');
+  const accelGEl = document.getElementById('accelG');
+  const gyroEl = document.getElementById('gyro');
+  const orientationEl = document.getElementById('orientation');
+  const magEl = document.getElementById('mag');
+  const quatEl = document.getElementById('quat');
+  const videoEl = document.getElementById('cam');
 
-  // ---------- three.js scene ----------
-  const canvas = document.getElementById('scene');
-  const renderer = new THREE.WebGLRenderer({ canvas, alpha:true, antialias:true });
-  renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
-  renderer.setSize(window.innerWidth, window.innerHeight);
+  let sensors = {
+    linearAccel: null,
+    accel: null,
+    gyro: null,
+    mag: null,
+    orient: null
+  };
+  let legacyHandlers = { motion: null, orientation: null };
+  let camStream = null;
 
-  const scene = new THREE.Scene();
-  const camera3d = new THREE.PerspectiveCamera(60, window.innerWidth/window.innerHeight, 0.05, 300);
-  camera3d.rotation.reorder('YXZ');
-
-  // ground grid for spatial reference
-  const grid = new THREE.GridHelper(60, 60, 0xffb020, 0x333333);
-  grid.material.transparent = true;
-  grid.material.opacity = 0.12;
-  grid.position.y = -1.4;
-  scene.add(grid);
-
-  // cube: wireframe + faint fill + a base ring so it reads as "planted" at a point
-  const cubeGroup = new THREE.Group();
-  const geo = new THREE.BoxGeometry(1,1,1);
-  const edges = new THREE.EdgesGeometry(geo);
-  const mat = new THREE.LineBasicMaterial({ color: 0xffb020, transparent:true, opacity:0.95 });
-  const wire = new THREE.LineSegments(edges, mat);
-  cubeGroup.add(wire);
-
-  const faceMat = new THREE.MeshBasicMaterial({ color:0xffb020, transparent:true, opacity:0.06, side:THREE.DoubleSide });
-  cubeGroup.add(new THREE.Mesh(geo, faceMat));
-
-  const ringGeo = new THREE.RingGeometry(0.55, 0.62, 32);
-  const ringMat = new THREE.MeshBasicMaterial({ color:0xffb020, transparent:true, opacity:0.5, side:THREE.DoubleSide });
-  const ring = new THREE.Mesh(ringGeo, ringMat);
-  ring.rotation.x = -Math.PI/2;
-  ring.position.y = -0.5;
-  cubeGroup.add(ring);
-
-  cubeGroup.scale.set(0.55,0.55,0.55);
-  scene.add(cubeGroup);
-
-  function onResize(){
-    renderer.setSize(window.innerWidth, window.innerHeight);
-    camera3d.aspect = window.innerWidth/window.innerHeight;
-    camera3d.updateProjectionMatrix();
-  }
-  window.addEventListener('resize', onResize);
-
-  // ---------- world state ----------
-  // Simple dead-reckoning: track the user's position on a flat plane using
-  // step count (sensor 1: accelerometer) and heading (sensor 2: compass/gyroscope).
-  const STEP_LENGTH = 0.72;   // average step, meters
-  const PLACE_DIST   = 3.0;   // meters in front when placing the cube
-
-  let userPos = { x:0, z:0 };
-  let anchorPos = { x:0, z:-PLACE_DIST };
-  let headingRad = 0; // current compass-ish heading, radians
-
-  function placeCube(){
-    anchorPos.x = userPos.x + Math.sin(headingRad) * PLACE_DIST;
-    anchorPos.z = userPos.z - Math.cos(headingRad) * PLACE_DIST;
-  }
-  placeBtn.addEventListener('click', placeCube);
-
-  // ---------- sensor 1: accelerometer -> steps ----------
-  let lastAccMag = 9.8;
-  let stepCount = 0;
-  let lastStepTime = 0;
-
-  function handleMotion(e){
-    const a = e.accelerationIncludingGravity || e.acceleration;
-    if(!a || a.x === null) return;
-    const mag = Math.sqrt((a.x||0)**2 + (a.y||0)**2 + (a.z||0)**2);
-    const delta = mag - lastAccMag;
-    lastAccMag = lastAccMag * 0.9 + mag * 0.1;
-
-    const now = performance.now();
-    if(delta > 1.6 && (now - lastStepTime) > 300){
-      stepCount++;
-      lastStepTime = now;
-      stepsEl.textContent = stepCount;
-      // walking moves the *user* forward along current heading —
-      // the cube, anchored in the world, is left behind.
-      userPos.x += Math.sin(headingRad) * STEP_LENGTH;
-      userPos.z -= Math.cos(headingRad) * STEP_LENGTH;
-    }
+  function log(msg){
+    const t = new Date().toLocaleTimeString();
+    logEl.innerHTML = `<div>[${t}] ${msg}</div>` + logEl.innerHTML;
   }
 
-  // ---------- sensor 2: gyroscope/compass -> heading + camera rotation ----------
-  const DEG2RAD = Math.PI/180;
-  let screenOrientRad = 0;
-
-  function updateScreenOrient(){
-    const angle = (screen.orientation && screen.orientation.angle) || window.orientation || 0;
-    screenOrientRad = angle * DEG2RAD;
+  function setStatus(){
+    const detects = [];
+    detects.push('AbsoluteOrientationSensor:' + (!!window.AbsoluteOrientationSensor));
+    detects.push('RelativeOrientationSensor:' + (!!window.RelativeOrientationSensor));
+    detects.push('LinearAccelerationSensor:' + (!!window.LinearAccelerationSensor));
+    detects.push('Accelerometer:' + (!!window.Accelerometer));
+    detects.push('Gyroscope:' + (!!window.Gyroscope));
+    detects.push('Magnetometer:' + (!!window.Magnetometer));
+    detects.push('DeviceMotionEvent:' + (!!window.DeviceMotionEvent));
+    detects.push('DeviceOrientationEvent:' + (!!window.DeviceOrientationEvent));
+    apisEl.textContent = detects.join('\n');
   }
-  updateScreenOrient();
-  window.addEventListener('orientationchange', updateScreenOrient);
+  setStatus();
 
-  // Standard device-orientation -> camera quaternion conversion (world-locked AR look)
-  const zeeAxis = new THREE.Vector3(0,0,1);
-  const euler = new THREE.Euler();
-  const baseQ = new THREE.Quaternion();
-  const minusHalfPiQ = new THREE.Quaternion(-Math.sqrt(0.5), 0, 0, Math.sqrt(0.5));
-  const screenQ = new THREE.Quaternion();
+  function setPerms(text){ permsEl.textContent = text; }
 
-  function applyDeviceQuaternion(alphaDeg, betaDeg, gammaDeg){
-    const alpha = alphaDeg * DEG2RAD;
-    const beta  = betaDeg  * DEG2RAD;
-    const gamma = gammaDeg * DEG2RAD;
-
-    euler.set(beta, alpha, -gamma, 'YXZ');
-    camera3d.quaternion.setFromEuler(euler);
-    camera3d.quaternion.multiply(minusHalfPiQ);
-    camera3d.quaternion.multiply(screenQ.setFromAxisAngle(zeeAxis, -screenOrientRad));
-
-    headingRad = alpha; // reuse compass heading for step dead-reckoning
-  }
-
-  function handleOrientation(e){
-    let alpha = e.alpha;
-    if(alpha === null) return;
-    if(typeof e.webkitCompassHeading === 'number'){
-      // iOS gives true compass heading directly (0 = north)
-      alpha = 360 - e.webkitCompassHeading;
-    }
-    applyDeviceQuaternion(alpha, e.beta || 0, e.gamma || 0);
-    tiltEl.textContent = Math.round(((alpha % 360) + 360) % 360) + '°';
-  }
-
-  // ---------- render loop ----------
-  function animate(){
-    requestAnimationFrame(animate);
-
-    camera3d.position.set(userPos.x, 0, userPos.z);
-    cubeGroup.position.set(anchorPos.x, 0, anchorPos.z);
-    cubeGroup.rotation.y += 0.004; // slow idle spin so it still reads as "alive"
-
-    const dx = anchorPos.x - userPos.x;
-    const dz = anchorPos.z - userPos.z;
-    const distance = Math.sqrt(dx*dx + dz*dz);
-    distEl.textContent = distance.toFixed(1) + ' m';
-    barEl.style.width = Math.min(100, (distance / 15) * 100).toFixed(0) + '%';
-
-    renderer.render(scene, camera3d);
-  }
-
-  // ---------- startup ----------
-  async function start(){
-    errEl.style.display = 'none';
+  async function startCamera(){
+    if(!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) return;
     try{
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: { ideal: 'environment' } },
-        audio: false
-      });
-      video.srcObject = stream;
-    }catch(camErr){
-      errEl.textContent = 'Não foi possível acessar a câmera: ' + camErr.message +
-        '. Isso costuma acontecer se a página não estiver em HTTPS, ou se a permissão foi negada antes — confira nas configurações do site no navegador.';
-      errEl.style.display = 'block';
-      return;
-    }
+      camStream = await navigator.mediaDevices.getUserMedia({video:{facingMode:'environment'}, audio:false});
+      videoEl.srcObject = camStream;
+    }catch(e){ log('camera erro: ' + e.message); }
+  }
 
+  function stopCamera(){ if(camStream){ camStream.getTracks().forEach(t=>t.stop()); camStream=null; videoEl.srcObject=null; }}
+
+  function startGeneric(){
+    let ok = false;
+    try{
+      const Absolute = window.AbsoluteOrientationSensor || window.RelativeOrientationSensor;
+      if(Absolute){
+        sensors.orient = new Absolute({frequency:60});
+        sensors.orient.addEventListener('reading', ()=>{
+          const q = sensors.orient.quaternion; if(q && q.length>=4){ quatEl.textContent = q.map(n=>n.toFixed(3)).join(', '); }
+        });
+        sensors.orient.addEventListener('error', ev=>{ log('orient sensor erro: ' + ev.error); });
+        sensors.orient.start(); ok = true;
+      }
+    }catch(e){ log('startAbsolute erro: ' + e.message); }
+
+    try{
+      if(window.LinearAccelerationSensor){
+        sensors.linearAccel = new LinearAccelerationSensor({frequency:60});
+        sensors.linearAccel.addEventListener('reading', ()=>{
+          accelEl.textContent = [sensors.linearAccel.x, sensors.linearAccel.y, sensors.linearAccel.z].map(v=> (v||0).toFixed(3)).join(', ');
+        });
+        sensors.linearAccel.addEventListener('error', ev=>{ log('linear accel erro: ' + ev.error); });
+        sensors.linearAccel.start(); ok = true;
+      }else if(window.Accelerometer){
+        sensors.accel = new Accelerometer({frequency:60});
+        sensors.accel.addEventListener('reading', ()=>{
+          accelEl.textContent = [sensors.accel.x, sensors.accel.y, sensors.accel.z].map(v=> (v||0).toFixed(3)).join(', ');
+        });
+        sensors.accel.start(); ok = true;
+      }
+    }catch(e){ log('start accel erro: ' + e.message); }
+
+    try{
+      if(window.Gyroscope){
+        sensors.gyro = new Gyroscope({frequency:60});
+        sensors.gyro.addEventListener('reading', ()=>{
+          gyroEl.textContent = [sensors.gyro.x, sensors.gyro.y, sensors.gyro.z].map(v=> (v||0).toFixed(3)).join(', ');
+        });
+        sensors.gyro.start(); ok = true;
+      }
+    }catch(e){ log('start gyro erro: ' + e.message); }
+
+    try{
+      if(window.Magnetometer){
+        sensors.mag = new Magnetometer({frequency:10});
+        sensors.mag.addEventListener('reading', ()=>{
+          magEl.textContent = [sensors.mag.x, sensors.mag.y, sensors.mag.z].map(v=> (v||0).toFixed(3)).join(', ');
+        });
+        sensors.mag.start(); ok = true;
+      }
+    }catch(e){ log('start mag erro: ' + e.message); }
+
+    return ok;
+  }
+
+  function stopGeneric(){
+    Object.keys(sensors).forEach(k=>{
+      try{ if(sensors[k] && typeof sensors[k].stop === 'function') sensors[k].stop(); }catch(e){}
+      sensors[k]=null;
+    });
+  }
+
+  function startLegacy(){
+    // devicemotion
+    legacyHandlers.motion = function(e){
+      const a = e.acceleration; const ag = e.accelerationIncludingGravity; const r = `a:${(a&&[a.x,a.y,a.z].map(v=>v?v.toFixed(3):'0.000').join(','))} / ag:${(ag&&[ag.x,ag.y,ag.z].map(v=>v?v.toFixed(3):'0.000').join(','))}`;
+      accelEl.textContent = a? [a.x,a.y,a.z].map(v=> (v||0).toFixed(3)).join(', ') : '—';
+      accelGEl.textContent = ag? [ag.x,ag.y,ag.z].map(v=> (v||0).toFixed(3)).join(', ') : '—';
+    };
+    window.addEventListener('devicemotion', legacyHandlers.motion, true);
+
+    legacyHandlers.orientation = function(e){
+      const a = e.alpha, b = e.beta, g = e.gamma;
+      orientationEl.textContent = (typeof a === 'number') ? [a.toFixed(1), b.toFixed(1), g.toFixed(1)].join(', ') : '—';
+      // show quaternion approx via Euler conversion (not exact but gives yaw)
+      quatEl.textContent = (typeof a === 'number') ? `α:${a.toFixed(1)}°` : '—';
+    };
+    window.addEventListener('deviceorientation', legacyHandlers.orientation, true);
+  }
+
+  function stopLegacy(){
+    if(legacyHandlers.motion) window.removeEventListener('devicemotion', legacyHandlers.motion, true);
+    if(legacyHandlers.orientation) window.removeEventListener('deviceorientation', legacyHandlers.orientation, true);
+    legacyHandlers.motion = legacyHandlers.orientation = null;
+  }
+
+  async function startAll(){
+    log('Iniciando — pedindo permissões quando necessário');
+    setPerms('pedindo...');
+    // request iOS permissions
     try{
       if(typeof DeviceMotionEvent !== 'undefined' && typeof DeviceMotionEvent.requestPermission === 'function'){
-        const p = await DeviceMotionEvent.requestPermission();
-        if(p !== 'granted') throw new Error('permissão de movimento negada');
+        const r = await DeviceMotionEvent.requestPermission(); log('DeviceMotion permission: ' + r); setPerms(prev => {});
       }
+    }catch(e){ log('DeviceMotion permission erro: ' + e.message); }
+    try{
       if(typeof DeviceOrientationEvent !== 'undefined' && typeof DeviceOrientationEvent.requestPermission === 'function'){
-        const p2 = await DeviceOrientationEvent.requestPermission();
-        if(p2 !== 'granted') throw new Error('permissão de orientação negada');
+        const r2 = await DeviceOrientationEvent.requestPermission(); log('DeviceOrientation permission: ' + r2);
       }
-    }catch(sensorErr){
-      errEl.textContent = 'Sensores de movimento indisponíveis: ' + sensorErr.message + '. A câmera funciona, mas o cubo não vai reagir aos seus passos nem à direção do celular.';
-      errEl.style.display = 'block';
+    }catch(e){ log('DeviceOrientation permission erro: ' + e.message); }
+
+    // start camera (optional) — do not block
+    startCamera().then(()=>log('camera iniciada')).catch(e=>log('camera falhou: '+(e.message||e)));
+
+    const genericWorked = startGeneric();
+    if(!genericWorked){
+      log('Generic Sensor API indisponível ou falhou — usando eventos legacy');
+      startLegacy();
+      setPerms('usando eventos legacy (devicemotion/deviceorientation)');
+    }else{
+      log('Generic Sensor API iniciada (alguns sensores)');
+      setPerms('Generic Sensor API (quando disponível)');
+      // still attach legacy orientation as fallback for alpha on some devices
+      window.addEventListener('deviceorientation', function(e){ if(typeof e.alpha === 'number') orientationEl.textContent = [e.alpha.toFixed(1), (e.beta||0).toFixed(1), (e.gamma||0).toFixed(1)].join(', '); }, true);
     }
 
-    window.addEventListener('devicemotion', handleMotion, true);
-    window.addEventListener('deviceorientation', handleOrientation, true);
-
-    placeCube();
-    gate.style.display = 'none';
-    animate();
+    statusEl.textContent = 'rodando';
   }
 
-  startBtn.addEventListener('click', start);
+  function stopAll(){
+    stopGeneric(); stopLegacy(); stopCamera(); statusEl.textContent = 'parado'; log('parado');
+  }
+
+  startBtn.addEventListener('click', async ()=>{
+    try{
+      await startAll();
+    }catch(e){ log('startAll erro: '+(e.message||e)); }
+  });
+  stopBtn.addEventListener('click', ()=>stopAll());
+
+  // initial feature list
+  setTimeout(()=>{
+    const f = [];
+    f.push('navigator.mediaDevices:' + !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia));
+    f.push('AbsoluteOrientationSensor:' + !!window.AbsoluteOrientationSensor);
+    f.push('RelativeOrientationSensor:' + !!window.RelativeOrientationSensor);
+    f.push('LinearAccelerationSensor:' + !!window.LinearAccelerationSensor);
+    f.push('Accelerometer:' + !!window.Accelerometer);
+    f.push('Gyroscope:' + !!window.Gyroscope);
+    f.push('Magnetometer:' + !!window.Magnetometer);
+    f.push('DeviceMotionEvent:' + !!window.DeviceMotionEvent);
+    f.push('DeviceOrientationEvent:' + !!window.DeviceOrientationEvent);
+    statusEl.textContent = 'pronto';
+    apisEl.textContent = f.join('\n');
+  }, 200);
+
 })();
 </script>
 </body>
