@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no, viewport-fit=cover">
-<title>Emulador de Giroscópio v3</title>
+<title>Emulador de Giroscópio v4 — Fusão</title>
 <style>
   html, body {
     margin: 0; padding: 0; overflow: hidden;
@@ -27,19 +27,26 @@
   }
 
   #hud {
-    position: fixed; top: 12px; left: 12px; color: #9fd; font-size: 11.5px;
+    position: fixed; top: 12px; left: 12px; color: #9fd; font-size: 11px;
     background: rgba(0,0,0,0.45); padding: 10px 14px; border-radius: 10px;
-    font-family: monospace; line-height: 1.7; z-index: 5; pointer-events: none;
-    min-width: 172px; backdrop-filter: blur(4px);
+    font-family: monospace; line-height: 1.65; z-index: 5; pointer-events: none;
+    min-width: 178px; backdrop-filter: blur(4px);
   }
   #hud .mode { color: #ffb020; font-weight: 700; }
   #hud .dim { color: rgba(159,255,221,0.5); }
+  #hud .still { color: #6bffb0; font-weight: 700; }
+  #hud .moving { color: rgba(159,255,221,0.85); }
 
   #qualityWrap {
     margin-top: 4px; width: 100%; height: 5px; background: rgba(255,255,255,0.1);
     border-radius: 3px; overflow: hidden;
   }
   #qualityBar { height: 100%; width: 0%; background: #6bffb0; transition: width 0.1s, background 0.2s; }
+  #agreeWrap {
+    margin-top: 3px; width: 100%; height: 5px; background: rgba(255,255,255,0.1);
+    border-radius: 3px; overflow: hidden;
+  }
+  #agreeBar { height: 100%; width: 0%; background: #4f8cff; transition: width 0.1s, background 0.2s; }
 
   #camPreview {
     position: fixed; top: 12px; right: 12px; width: 92px; height: 70px;
@@ -75,10 +82,14 @@
 <div id="hud">
   cima/baixo: <span class="mode" id="modePR">-</span><br>
   esquerda/direita: <span class="mode" id="modeY">-</span><br>
+  estado: <span id="stillState">-</span><br>
   <span class="dim" id="perfLine">- ms · - fps</span><br>
   cima/baixo: <span id="p">0.0</span>°<br>
   esquerda/direita: <span id="y">0.0</span>°
+  <div class="dim">confiança câmera</div>
   <div id="qualityWrap"><div id="qualityBar"></div></div>
+  <div class="dim">concordância c/ acelerômetro</div>
+  <div id="agreeWrap"><div id="agreeBar"></div></div>
 </div>
 
 <video id="camPreview" playsinline autoplay muted></video>
@@ -94,16 +105,16 @@
 </div>
 
 <div id="hint">
-  Esquerda/direita vem da câmera. Aponte pra algo com detalhe e boa luz.
-  Cima/baixo vem do sensor de movimento do celular.
+  Câmera e acelerômetro se checam mutuamente: parado, trava o yaw (zero-velocity
+  update); em movimento, compara o quanto os dois concordam antes de confiar.
 </div>
 
 <div id="overlay">
-  <h2>Emulador de Giroscópio v3</h2>
+  <h2>Emulador de Giroscópio v4</h2>
   <p>
-    Rastreamento em duas etapas (grosseira + refinada) pra maior alcance e
-    precisão, suavização por confiança, tela sempre acesa durante o uso.
-    Precisa de permissão de câmera e movimento.
+    Fusão real: acelerômetro detecta quando o celular está parado e trava
+    qualquer deriva da câmera; em movimento, valida o rastreio visual
+    comparando com a inclinação medida pelo sensor.
   </p>
   <button id="startBtn">Ativar</button>
 </div>
@@ -129,12 +140,10 @@ const rimLight = new THREE.DirectionalLight(0x88aaff, 0.4);
 rimLight.position.set(-4, -2, -3);
 scene.add(rimLight);
 
-// Chão em grade — referência espacial pra perceber a rotação melhor
 const grid = new THREE.GridHelper(10, 20, 0x2a3a4a, 0x151f28);
 grid.position.y = -1.3;
 scene.add(grid);
 
-// Cubo com rótulo de letra em cada face (facilita perceber a rotação)
 function makeFaceTexture(label, bg) {
   const c = document.createElement('canvas');
   c.width = 256; c.height = 256;
@@ -149,12 +158,9 @@ function makeFaceTexture(label, bg) {
   return new THREE.CanvasTexture(c);
 }
 const faceDefs = [
-  { l: 'D', c: '#ff4f4f' }, // direita
-  { l: 'E', c: '#4fff88' }, // esquerda
-  { l: '↑', c: '#4f8cff' }, // cima
-  { l: '↓', c: '#ffe14f' }, // baixo
-  { l: 'F', c: '#ff4fe1' }, // frente
-  { l: 'T', c: '#4ffff2' }, // trás
+  { l: 'D', c: '#ff4f4f' }, { l: 'E', c: '#4fff88' },
+  { l: '↑', c: '#4f8cff' }, { l: '↓', c: '#ffe14f' },
+  { l: 'F', c: '#ff4fe1' }, { l: 'T', c: '#4ffff2' },
 ];
 const materials = faceDefs.map(f => new THREE.MeshStandardMaterial({ map: makeFaceTexture(f.l, f.c) }));
 const geometry = new THREE.BoxGeometry(1.6, 1.6, 1.6);
@@ -176,7 +182,6 @@ let sensitivity = saved.sensitivity || 1.0;
 function saveSettings() {
   localStorage.setItem('gyroEmuSettings', JSON.stringify({ invertDir, sensitivity }));
 }
-
 const sensSlider = document.getElementById('sensSlider');
 sensSlider.value = sensitivity;
 document.getElementById('sensVal').textContent = sensitivity.toFixed(1) + 'x';
@@ -190,17 +195,40 @@ sensSlider.addEventListener('input', () => {
 let pitch = 0, yaw = 0;
 let pitchOffset = 0;
 let rawPitch = 0;
+let prevRawPitchAtTick = 0;
 document.getElementById('modePR').textContent = 'aguardando';
 document.getElementById('modeY').textContent = 'aguardando';
 
-// ================= Acelerômetro -> pitch (cima/baixo) =================
+// ================= Acelerômetro: pitch + detecção de "parado" =================
 let fx = 0, fy = 0, fz = 0, accelFirst = true;
 const ALPHA_LP = 0.15;
 let orientationGaveRealBeta = false;
 
+// Janela curta de magnitude bruta pra detectar variância (movimento real vs ruído)
+const MAG_HISTORY_SIZE = 12;
+let magHistory = [];
+let stillCounter = 0;
+const STILL_FRAMES_REQUIRED = 18; // ~0.25-0.35s de estabilidade pra confirmar "parado"
+const STILL_VARIANCE_LIMIT = 0.04;
+let isStill = false;
+
 function handleMotion(e) {
   const g = e.accelerationIncludingGravity;
-  if (!g || typeof g.x !== 'number' || orientationGaveRealBeta) return;
+  if (!g || typeof g.x !== 'number') return;
+
+  // Variância da magnitude bruta (não filtrada) -> detecta se há movimento real
+  const mag = Math.sqrt(g.x*g.x + g.y*g.y + g.z*g.z);
+  magHistory.push(mag);
+  if (magHistory.length > MAG_HISTORY_SIZE) magHistory.shift();
+  if (magHistory.length === MAG_HISTORY_SIZE) {
+    const mean = magHistory.reduce((a,b)=>a+b,0) / magHistory.length;
+    const variance = magHistory.reduce((a,b)=>a+(b-mean)*(b-mean),0) / magHistory.length;
+    if (variance < STILL_VARIANCE_LIMIT) stillCounter++; else stillCounter = 0;
+    isStill = stillCounter >= STILL_FRAMES_REQUIRED;
+  }
+
+  if (orientationGaveRealBeta) return; // giroscópio real manda, se existir
+
   if (accelFirst) { fx=g.x; fy=g.y; fz=g.z; accelFirst=false; }
   else {
     fx += (g.x - fx) * ALPHA_LP;
@@ -225,15 +253,15 @@ function handleOrientation(e) {
   }
 }
 
-// ================= Câmera -> fluxo ótico em pirâmide (yaw) =================
-// Etapa 1 (grosseira): resolução bem baixa, busca ampla -> acha a região certa.
-// Etapa 2 (fina): resolução maior, busca pequena ao redor do resultado grosseiro
-// -> refina sem custo de uma busca ampla na resolução alta.
-const COARSE_W = 24, COARSE_H = 18, COARSE_RANGE = 10;
+// ================= Câmera: fluxo ótico 2D em pirâmide =================
+const COARSE_W = 24, COARSE_H = 18, COARSE_RANGE = 8;
 const FINE_W = 48, FINE_H = 36, FINE_RANGE = 3;
 const FOV_H_DEG = 60;
-const DEG_PER_PIXEL_FINE = FOV_H_DEG / FINE_W;
-const NOISE_SCORE_LIMIT = 16; // acima disso, confiança = 0
+const FOV_V_DEG = FOV_H_DEG * (FINE_H / FINE_W);
+const DEG_PER_PIXEL_X = FOV_H_DEG / FINE_W;
+const DEG_PER_PIXEL_Y = FOV_V_DEG / FINE_H;
+const NOISE_SCORE_LIMIT = 16;
+const AGREEMENT_TOLERANCE_PX = 3.5; // quanto de divergência vertical ainda é tolerável
 
 let cameraActive = false;
 const videoEl = document.getElementById('camPreview');
@@ -241,7 +269,6 @@ const videoEl = document.getElementById('camPreview');
 const coarseCanvas = document.createElement('canvas');
 coarseCanvas.width = COARSE_W; coarseCanvas.height = COARSE_H;
 const coarseCtx = coarseCanvas.getContext('2d', { willReadFrequently: true });
-
 const fineCanvas = document.createElement('canvas');
 fineCanvas.width = FINE_W; fineCanvas.height = FINE_H;
 const fineCtx = fineCanvas.getContext('2d', { willReadFrequently: true });
@@ -257,24 +284,28 @@ function toGray(ctx, w, h) {
   return gray;
 }
 
-function bestShiftX(prev, curr, w, h, center, range) {
-  let bestDx = center, bestScore = Infinity;
-  const lo = center - range, hi = center + range;
-  for (let dx = lo; dx <= hi; dx++) {
-    let sad = 0, count = 0;
-    for (let yy = 3; yy < h - 3; yy++) {
-      for (let xx = 3; xx < w - 3; xx++) {
-        const sx = xx + dx;
-        if (sx < 0 || sx >= w) continue;
-        sad += Math.abs(curr[yy*w + xx] - prev[yy*w + sx]);
-        count++;
+// Busca 2D (dx, dy) por diferença mínima — amostragem a cada 2px pra manter leve
+function bestShift2D(prev, curr, w, h, centerX, centerY, range) {
+  let bestDx = centerX, bestDy = centerY, bestScore = Infinity;
+  for (let dy = centerY - range; dy <= centerY + range; dy++) {
+    for (let dx = centerX - range; dx <= centerX + range; dx++) {
+      let sad = 0, count = 0;
+      for (let yy = 3; yy < h - 3; yy += 2) {
+        const sy = yy + dy;
+        if (sy < 0 || sy >= h) continue;
+        for (let xx = 3; xx < w - 3; xx += 2) {
+          const sx = xx + dx;
+          if (sx < 0 || sx >= w) continue;
+          sad += Math.abs(curr[yy*w + xx] - prev[sy*w + sx]);
+          count++;
+        }
       }
+      if (count === 0) continue;
+      const score = sad / count;
+      if (score < bestScore) { bestScore = score; bestDx = dx; bestDy = dy; }
     }
-    if (count === 0) continue;
-    const score = sad / count;
-    if (score < bestScore) { bestScore = score; bestDx = dx; }
   }
-  return { dx: bestDx, score: bestScore };
+  return { dx: bestDx, dy: bestDy, score: bestScore };
 }
 
 let lastTickTime = performance.now();
@@ -290,22 +321,38 @@ function opticalFlowTick() {
   const currFine = toGray(fineCtx, FINE_W, FINE_H);
 
   if (prevCoarse && prevFine) {
-    // Etapa grosseira: acha direção aproximada com busca ampla, resolução baixa
-    const coarse = bestShiftX(prevCoarse, currCoarse, COARSE_W, COARSE_H, 0, COARSE_RANGE);
-    // Etapa fina: converte a estimativa grosseira pra escala fina e refina
-    const coarseInFineScale = Math.round(coarse.dx * (FINE_W / COARSE_W));
-    const fine = bestShiftX(prevFine, currFine, FINE_W, FINE_H, coarseInFineScale, FINE_RANGE);
+    const coarse = bestShift2D(prevCoarse, currCoarse, COARSE_W, COARSE_H, 0, 0, COARSE_RANGE);
+    const centerX = Math.round(coarse.dx * (FINE_W / COARSE_W));
+    const centerY = Math.round(coarse.dy * (FINE_H / COARSE_H));
+    const fine = bestShift2D(prevFine, currFine, FINE_W, FINE_H, centerX, centerY, FINE_RANGE);
 
     const confidence = Math.max(0, 1 - fine.score / NOISE_SCORE_LIMIT);
-    const qualityBar = document.getElementById('qualityBar');
-    qualityBar.style.width = (confidence * 100).toFixed(0) + '%';
-    qualityBar.style.background = confidence > 0.5 ? '#6bffb0' : confidence > 0.2 ? '#ffcf4f' : '#ff6b6b';
 
-    if (confidence > 0.12) {
-      const deltaDeg = -fine.dx * DEG_PER_PIXEL_FINE * invertDir * sensitivity;
-      // suaviza mais quando a confiança é baixa, pra não "pular" com ruído
-      yaw += THREE.MathUtils.degToRad(deltaDeg) * (0.4 + 0.6 * confidence);
-      document.getElementById('modeY').textContent = 'câmera';
+    // ---- Validação cruzada: o quanto o deslocamento vertical medido pela
+    // câmera bate com a variação de inclinação medida pelo acelerômetro ----
+    const accelPitchDeltaDeg = THREE.MathUtils.radToDeg(rawPitch - prevRawPitchAtTick);
+    const expectedVerticalPx = accelPitchDeltaDeg / DEG_PER_PIXEL_Y;
+    const verticalDiff = Math.abs(fine.dy - expectedVerticalPx);
+    const agreement = Math.max(0, 1 - verticalDiff / AGREEMENT_TOLERANCE_PX);
+    prevRawPitchAtTick = rawPitch;
+
+    document.getElementById('qualityBar').style.width = (confidence*100).toFixed(0) + '%';
+    document.getElementById('qualityBar').style.background = confidence > 0.5 ? '#6bffb0' : confidence > 0.2 ? '#ffcf4f' : '#ff6b6b';
+    document.getElementById('agreeBar').style.width = (agreement*100).toFixed(0) + '%';
+    document.getElementById('agreeBar').style.background = agreement > 0.5 ? '#4f8cff' : agreement > 0.2 ? '#ffcf4f' : '#ff6b6b';
+
+    const stillEl = document.getElementById('stillState');
+    if (isStill) { stillEl.textContent = 'parado (travando yaw)'; stillEl.className = 'still'; }
+    else { stillEl.textContent = 'em movimento'; stillEl.className = 'moving'; }
+
+    // ---- Peso final: confiança da câmera × concordância com acelerômetro × travamento se parado ----
+    const stillnessFactor = isStill ? 0.03 : 1;
+    const trust = confidence * (0.5 + 0.5*agreement) * stillnessFactor;
+
+    if (trust > 0.08) {
+      const deltaDeg = -fine.dx * DEG_PER_PIXEL_X * invertDir * sensitivity;
+      yaw += THREE.MathUtils.degToRad(deltaDeg) * trust;
+      if (!isStill) document.getElementById('modeY').textContent = 'câmera+acel (fusão)';
     }
   }
 
@@ -327,7 +374,7 @@ async function startCamera() {
     videoEl.srcObject = stream;
     await videoEl.play();
     cameraActive = true;
-    setInterval(opticalFlowTick, 70);
+    setInterval(opticalFlowTick, 80);
   } catch (err) {
     document.getElementById('modeY').textContent = 'toque (câmera negada)';
   }
@@ -368,12 +415,11 @@ document.getElementById('camToggleBtn').addEventListener('click', (e) => {
   e.target.textContent = hidden ? 'Mostrar câmera' : 'Esconder câmera';
 });
 
-// ================= Wake Lock: mantém a tela acesa durante o uso =================
+// ================= Wake Lock =================
 let wakeLock = null;
 async function requestWakeLock() {
-  try {
-    if ('wakeLock' in navigator) wakeLock = await navigator.wakeLock.request('screen');
-  } catch (err) { /* silencioso — alguns navegadores negam, sem problema */ }
+  try { if ('wakeLock' in navigator) wakeLock = await navigator.wakeLock.request('screen'); }
+  catch (err) { /* silencioso */ }
 }
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'visible' && cameraActive) requestWakeLock();
