@@ -247,33 +247,44 @@ function handleOrientation(e) {
   }
 }
 
-// ================= Câmera: fluxo ótico 2D em pirâmide -> yaw =================
-const COARSE_W = 24, COARSE_H = 18, COARSE_RANGE = 8;
-const FINE_W = 48, FINE_H = 36, FINE_RANGE = 3;
+// ================= Câmera: rastreio multi-ponto -> yaw =================
+// Em vez de comparar o frame inteiro (frágil contra objetos que se mexem na
+// cena ou reflexos localizados), rastreamos vários pontos independentes e
+// combinamos por consenso — descartando os que discordam da maioria.
+const FINE_W = 48, FINE_H = 36;
 const FOV_H_DEG = 60;
 const FOV_V_DEG = FOV_H_DEG * (FINE_H / FINE_W);
 const DEG_PER_PIXEL_X = FOV_H_DEG / FINE_W;
 const DEG_PER_PIXEL_Y = FOV_V_DEG / FINE_H;
-const NOISE_SCORE_LIMIT = 16;
 const AGREEMENT_TOLERANCE_PX = 3.5;
+
+const PATCH_HALF = 3;        // patch de 7x7 por ponto
+const SEARCH_RANGE = 5;      // busca ao redor da posição prevista
+const TEXTURE_MIN_VARIANCE = 60; // abaixo disso, patch "liso demais" (céu, parede lisa) -> descarta
+const CONSENSUS_TOLERANCE_PX = 1.6;
+
+// Grade de 9 pontos de rastreio dentro do frame (margem pra caber o patch)
+const TRACK_POINTS = [
+  {x:12,y:9},{x:24,y:9},{x:36,y:9},
+  {x:12,y:18},{x:24,y:18},{x:36,y:18},
+  {x:12,y:27},{x:24,y:27},{x:36,y:27},
+];
 
 let cameraActive = false;
 const videoEl = document.getElementById('camPreview');
 
-// Detecção de "realmente parado" agora vem da própria câmera, não do
-// acelerômetro — girar só no eixo horizontal (yaw) quase não muda a leitura
-// de gravidade, então usar o acelerômetro pra isso travava o yaw por engano.
 const DX_HISTORY_SIZE = 12;
 let dxHistory = [];
-const CAMERA_STILL_DX_LIMIT = 1.1; // px
+const CAMERA_STILL_DX_LIMIT = 1.1;
 
-const coarseCanvas = document.createElement('canvas');
-coarseCanvas.width = COARSE_W; coarseCanvas.height = COARSE_H;
-const coarseCtx = coarseCanvas.getContext('2d', { willReadFrequently: true });
 const fineCanvas = document.createElement('canvas');
 fineCanvas.width = FINE_W; fineCanvas.height = FINE_H;
 const fineCtx = fineCanvas.getContext('2d', { willReadFrequently: true });
-let prevCoarse = null, prevFine = null;
+let prevFine = null;
+
+// Previsão de onde os pontos devem estar (baseado no resultado do frame
+// anterior) — reduz a busca necessária e ajuda a acompanhar giros rápidos.
+let predictedDx = 0, predictedDy = 0;
 
 function toGray(ctx, w, h) {
   const data = ctx.getImageData(0, 0, w, h).data;
@@ -284,71 +295,127 @@ function toGray(ctx, w, h) {
   return gray;
 }
 
-function bestShift2D(prev, curr, w, h, centerX, centerY, range) {
-  let bestDx = centerX, bestDy = centerY, bestScore = Infinity;
-  for (let dy = centerY - range; dy <= centerY + range; dy++) {
-    for (let dx = centerX - range; dx <= centerX + range; dx++) {
-      let sad = 0, count = 0;
-      for (let yy = 3; yy < h - 3; yy += 2) {
-        const sy = yy + dy;
-        if (sy < 0 || sy >= h) continue;
-        for (let xx = 3; xx < w - 3; xx += 2) {
-          const sx = xx + dx;
-          if (sx < 0 || sx >= w) continue;
-          sad += Math.abs(curr[yy*w + xx] - prev[sy*w + sx]);
-          count++;
-        }
-      }
-      if (count === 0) continue;
-      const score = sad / count;
-      if (score < bestScore) { bestScore = score; bestDx = dx; bestDy = dy; }
+function patchVariance(img, w, cx, cy) {
+  let sum = 0, sumSq = 0, count = 0;
+  for (let dy = -PATCH_HALF; dy <= PATCH_HALF; dy++) {
+    for (let dx = -PATCH_HALF; dx <= PATCH_HALF; dx++) {
+      const v = img[(cy+dy)*w + (cx+dx)];
+      sum += v; sumSq += v*v; count++;
     }
   }
-  return { dx: bestDx, dy: bestDy, score: bestScore };
+  const mean = sum / count;
+  return sumSq / count - mean * mean;
 }
+
+function trackPoint(prev, curr, w, h, px, py, centerDx, centerDy) {
+  let bestDx = centerDx, bestDy = centerDy, bestScore = Infinity;
+  for (let dy = centerDy - SEARCH_RANGE; dy <= centerDy + SEARCH_RANGE; dy++) {
+    const sy = py + dy;
+    if (sy - PATCH_HALF < 0 || sy + PATCH_HALF >= h) continue;
+    for (let dx = centerDx - SEARCH_RANGE; dx <= centerDx + SEARCH_RANGE; dx++) {
+      const sx = px + dx;
+      if (sx - PATCH_HALF < 0 || sx + PATCH_HALF >= w) continue;
+      let sad = 0;
+      for (let yy = -PATCH_HALF; yy <= PATCH_HALF; yy++) {
+        for (let xx = -PATCH_HALF; xx <= PATCH_HALF; xx++) {
+          sad += Math.abs(curr[(py+yy)*w + (px+xx)] - prev[(sy+yy)*w + (sx+xx)]);
+        }
+      }
+      if (sad < bestScore) { bestScore = sad; bestDx = dx; bestDy = dy; }
+    }
+  }
+  const patchSize = (PATCH_HALF*2+1) * (PATCH_HALF*2+1);
+  return { dx: bestDx, dy: bestDy, avgSad: bestScore / patchSize };
+}
+
+function median(arr) {
+  const s = [...arr].sort((a,b)=>a-b);
+  const mid = Math.floor(s.length/2);
+  return s.length % 2 ? s[mid] : (s[mid-1]+s[mid])/2;
+}
+
+// ---- Áudio: bipe curto quando o rastreio cai (útil dentro da caixa, sem ver o HUD) ----
+let audioCtx = null;
+let lastBeepTime = 0;
+let wasTrackingGood = true;
+function beep(freq, durationMs) {
+  try {
+    if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    const osc = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+    osc.frequency.value = freq;
+    gain.gain.setValueAtTime(0.06, audioCtx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + durationMs/1000);
+    osc.connect(gain); gain.connect(audioCtx.destination);
+    osc.start(); osc.stop(audioCtx.currentTime + durationMs/1000);
+  } catch (e) {}
+}
+
+let yawVelocity = 0; // rad/s — usado pra extrapolar movimento suave entre leituras da câmera
+let lastYawTickTime = performance.now();
 
 function opticalFlowTick() {
   if (!cameraActive) return;
-  coarseCtx.drawImage(videoEl, 0, 0, COARSE_W, COARSE_H);
-  const currCoarse = toGray(coarseCtx, COARSE_W, COARSE_H);
   fineCtx.drawImage(videoEl, 0, 0, FINE_W, FINE_H);
   const currFine = toGray(fineCtx, FINE_W, FINE_H);
 
-  if (prevCoarse && prevFine) {
-    const coarse = bestShift2D(prevCoarse, currCoarse, COARSE_W, COARSE_H, 0, 0, COARSE_RANGE);
-    const centerX = Math.round(coarse.dx * (FINE_W / COARSE_W));
-    const centerY = Math.round(coarse.dy * (FINE_H / COARSE_H));
-    const fine = bestShift2D(prevFine, currFine, FINE_W, FINE_H, centerX, centerY, FINE_RANGE);
+  if (prevFine) {
+    const results = [];
+    for (const pt of TRACK_POINTS) {
+      if (patchVariance(prevFine, FINE_W, pt.x, pt.y) < TEXTURE_MIN_VARIANCE) continue; // sem textura, pula
+      const r = trackPoint(prevFine, currFine, FINE_W, FINE_H, pt.x, pt.y, Math.round(predictedDx), Math.round(predictedDy));
+      results.push(r);
+    }
 
-    const confidence = Math.max(0, 1 - fine.score / NOISE_SCORE_LIMIT);
-    const accelPitchDeltaDeg = THREE.MathUtils.radToDeg(rawPitch - prevRawPitchAtTick);
-    const expectedVerticalPx = accelPitchDeltaDeg / DEG_PER_PIXEL_Y;
-    const verticalDiff = Math.abs(fine.dy - expectedVerticalPx);
-    const agreement = Math.max(0, 1 - verticalDiff / AGREEMENT_TOLERANCE_PX);
-    prevRawPitchAtTick = rawPitch;
+    if (results.length >= 3) {
+      const dxs = results.map(r => r.dx);
+      const dys = results.map(r => r.dy);
+      const medDx = median(dxs);
+      const medDy = median(dys);
+      const inliers = results.filter(r => Math.abs(r.dx - medDx) <= CONSENSUS_TOLERANCE_PX);
+      const consensus = inliers.length / results.length;
 
-    // Histórico do deslocamento horizontal medido pela câmera: só consideramos
-    // "parado de verdade" quando o próprio movimento visual fica perto de zero
-    // de forma consistente — não quando o acelerômetro acha que está parado
-    // (que também acontece durante um giro horizontal puro).
-    dxHistory.push(fine.dx);
-    if (dxHistory.length > DX_HISTORY_SIZE) dxHistory.shift();
-    const avgAbsDx = dxHistory.reduce((a,b)=>a+Math.abs(b),0) / dxHistory.length;
-    const cameraStill = dxHistory.length === DX_HISTORY_SIZE && avgAbsDx < CAMERA_STILL_DX_LIMIT;
+      predictedDx = medDx; predictedDy = medDy; // previsão pro próximo frame
 
-    const stillEl = document.getElementById('stillState');
-    stillEl.textContent = cameraStill ? 'parado' : 'movendo';
+      const accelPitchDeltaDeg = THREE.MathUtils.radToDeg(rawPitch - prevRawPitchAtTick);
+      const expectedVerticalPx = accelPitchDeltaDeg / DEG_PER_PIXEL_Y;
+      const verticalDiff = Math.abs(medDy - expectedVerticalPx);
+      const agreement = Math.max(0, 1 - verticalDiff / AGREEMENT_TOLERANCE_PX);
+      prevRawPitchAtTick = rawPitch;
 
-    const stillnessFactor = cameraStill ? 0.15 : 1;
-    const trust = confidence * (0.5 + 0.5*agreement) * stillnessFactor;
+      dxHistory.push(medDx);
+      if (dxHistory.length > DX_HISTORY_SIZE) dxHistory.shift();
+      const avgAbsDx = dxHistory.reduce((a,b)=>a+Math.abs(b),0) / dxHistory.length;
+      const cameraStill = dxHistory.length === DX_HISTORY_SIZE && avgAbsDx < CAMERA_STILL_DX_LIMIT;
 
-    if (trust > 0.08) {
-      const deltaDeg = -fine.dx * DEG_PER_PIXEL_X;
-      yaw += THREE.MathUtils.degToRad(deltaDeg) * trust;
-      if (!cameraStill) document.getElementById('modeY').textContent = 'câmera+acel';
+      const stillEl = document.getElementById('stillState');
+      stillEl.textContent = cameraStill ? 'parado' : 'movendo';
+
+      const stillnessFactor = cameraStill ? 0.15 : 1;
+      const trust = consensus * (0.5 + 0.5*agreement) * stillnessFactor;
+
+      const now = performance.now();
+      const dt = Math.max(0.02, (now - lastYawTickTime) / 1000);
+      lastYawTickTime = now;
+
+      if (trust > 0.15) {
+        const deltaDeg = -medDx * DEG_PER_PIXEL_X;
+        const deltaRad = THREE.MathUtils.degToRad(deltaDeg) * trust;
+        yaw += deltaRad;
+        yawVelocity = yawVelocity * 0.5 + (deltaRad / dt) * 0.5; // suaviza a velocidade estimada
+        if (!cameraStill) document.getElementById('modeY').textContent = 'câmera (9 pts)';
+      } else {
+        yawVelocity *= 0.6; // sem confiança -> desacelera a extrapolação em vez de travar de repente
+      }
+
+      // Bipe quando a qualidade do rastreio piora (útil sem ver a tela dentro da caixa)
+      const trackingGoodNow = consensus > 0.5;
+      if (wasTrackingGood && !trackingGoodNow && performance.now() - lastBeepTime > 1500) {
+        beep(280, 150); lastBeepTime = performance.now();
+      }
+      wasTrackingGood = trackingGoodNow;
     }
   }
-  prevCoarse = currCoarse;
   prevFine = currFine;
 }
 
@@ -465,7 +532,12 @@ document.getElementById('vrBtn').addEventListener('click', async () => {
 function animate() {
   requestAnimationFrame(animate);
 
-  head.rotation.y += (yaw - head.rotation.y) * 0.2;
+  // Extrapola o yaw usando a velocidade estimada, pra não "escadar" entre
+  // as leituras da câmera (que rodam a ~12Hz, bem mais devagar que os 60fps da tela)
+  const dtFrame = Math.min(0.05, (performance.now() - lastYawTickTime) / 1000);
+  const yawExtrapolated = yaw + yawVelocity * dtFrame * 0.4;
+
+  head.rotation.y += (yawExtrapolated - head.rotation.y) * 0.35;
   head.rotation.x += (pitch - head.rotation.x) * 0.2;
 
   document.getElementById('p').textContent = THREE.MathUtils.radToDeg(pitch).toFixed(1);
