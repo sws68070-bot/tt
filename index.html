@@ -79,7 +79,8 @@
 <div id="vignette"></div>
 <div id="hud">
   yaw: <span id="y">0.0</span>° · pitch: <span id="p">0.0</span>°<br>
-  <span id="modeY">-</span> · <span id="stillState">-</span>
+  <span id="modeY">-</span> · <span id="stillState">-</span><br>
+  ⚓ <span id="anchorState">-</span>
 </div>
 <div id="reticle"></div>
 <video id="camPreview" playsinline autoplay muted></video>
@@ -87,6 +88,7 @@
 
 <div id="topControls">
   <button id="calibBtn">Recentralizar</button>
+  <button id="anchorBtn">⚓ Ancorar ponto</button>
   <button id="exitVrBtn" style="display:none">Sair do VR</button>
 </div>
 
@@ -105,6 +107,11 @@
   <p style="font-size:11px; color:rgba(255,180,32,0.85)">
     Atenção: se o VR box tampar a câmera traseira, o rastreio de yaw por
     câmera não funciona — só a inclinação (pitch) continua ativa.
+  </p>
+  <p style="font-size:11px">
+    Dica: mire o retículo num detalhe de uma parede/objeto real e toque em
+    "⚓ Ancorar ponto" — o emulador guarda essa referência e usa ela pra se
+    reajustar sozinho quando a deriva acumular.
   </p>
   <div>
     <button id="startBtn">Ativar sensores</button>
@@ -212,30 +219,14 @@ let rawPitch = 0;
 let prevRawPitchAtTick = 0;
 const MAX_PITCH = THREE.MathUtils.degToRad(85); // evita virar de cabeça pra baixo (gimbal lock)
 
-// ================= Acelerômetro: pitch + detecção de "parado" =================
+// ================= Acelerômetro: pitch =================
 let fx = 0, fy = 0, fz = 0, accelFirst = true;
 const ALPHA_LP = 0.15;
 let orientationGaveRealBeta = false;
-const MAG_HISTORY_SIZE = 12;
-let magHistory = [];
-let stillCounter = 0;
-const STILL_FRAMES_REQUIRED = 18;
-const STILL_VARIANCE_LIMIT = 0.04;
-let isStill = false;
 
 function handleMotion(e) {
   const g = e.accelerationIncludingGravity;
   if (!g || typeof g.x !== 'number') return;
-
-  const mag = Math.sqrt(g.x*g.x + g.y*g.y + g.z*g.z);
-  magHistory.push(mag);
-  if (magHistory.length > MAG_HISTORY_SIZE) magHistory.shift();
-  if (magHistory.length === MAG_HISTORY_SIZE) {
-    const mean = magHistory.reduce((a,b)=>a+b,0) / magHistory.length;
-    const variance = magHistory.reduce((a,b)=>a+(b-mean)*(b-mean),0) / magHistory.length;
-    if (variance < STILL_VARIANCE_LIMIT) stillCounter++; else stillCounter = 0;
-    isStill = stillCounter >= STILL_FRAMES_REQUIRED;
-  }
 
   if (orientationGaveRealBeta) return;
 
@@ -299,10 +290,6 @@ const pointHealth = ALL_POINTS.map(() => 1.0);
 
 let cameraActive = false;
 const videoEl = document.getElementById('camPreview');
-
-const DX_HISTORY_SIZE = 12;
-let dxHistory = [];
-const CAMERA_STILL_DX_LIMIT = 1.1;
 
 const fineCanvas = document.createElement('canvas');
 fineCanvas.width = FINE_W; fineCanvas.height = FINE_H;
@@ -392,6 +379,122 @@ function weightedMedian(items) { // items: [{value, weight}]
 let yawVelocity = 0; // rad/s — usado pra extrapolar movimento suave entre leituras da câmera
 let lastYawTickTime = performance.now();
 
+// ================= Ponto ancorado: corrige a deriva acumulada =================
+// O rastreio por câmera compara só frame-a-frame, então pequenos erros vão
+// somando com o tempo (deriva). Um "ponto ancorado" guarda o padrão de
+// textura de um objeto/parede real (mirado no centro/retículo) junto com o
+// yaw registrado naquele instante. De tempos em tempos o emulador procura
+// esse mesmo padrão de novo no frame atual — se achar, usa a posição
+// encontrada pra puxar o yaw de volta pro lugar certo, como um "reencontro"
+// que trava a deriva num ponto conhecido do ambiente.
+const ANCHOR_PATCH_HALF = 6;         // patch maior (13x13) -> padrão mais distintivo pra reencontrar
+const ANCHOR_SEARCH_RANGE = 14;      // busca ampla, cobre deriva grande já acumulada
+const ANCHOR_MATCH_THRESHOLD = 20;   // SAD médio por pixel abaixo disso = achou o ponto de novo
+const ANCHOR_CORRECTION_GAIN = 0.15; // corrige aos poucos (suave), nunca trava de uma vez
+const ANCHOR_CHECK_INTERVAL = 4;     // só tenta reencontrar a cada N ticks (busca ampla é cara)
+const MAX_ANCHORS = 5;
+const anchors = []; // { patch, yawAtCapture, health }
+let anchorCursor = 0;
+let opticalTickCount = 0;
+let anchorStatusTimeout = null;
+
+function flashAnchorStatus(text) {
+  const el = document.getElementById('anchorState');
+  if (!el) return;
+  el.textContent = text;
+  const reticle = document.getElementById('reticle');
+  if (reticle) {
+    reticle.style.background = 'rgba(255,176,32,0.95)';
+    setTimeout(() => { reticle.style.background = 'rgba(255,255,255,0.7)'; }, 400);
+  }
+  clearTimeout(anchorStatusTimeout);
+  anchorStatusTimeout = setTimeout(() => {
+    el.textContent = anchors.length ? `${anchors.length} ponto(s) ativo(s)` : '-';
+  }, 2000);
+}
+
+function captureAnchorPatch(img, w, cx, cy, half) {
+  const patch = new Float32Array((half*2+1) * (half*2+1));
+  let k = 0;
+  for (let dy = -half; dy <= half; dy++)
+    for (let dx = -half; dx <= half; dx++)
+      patch[k++] = img[(cy+dy)*w + (cx+dx)];
+  return patch;
+}
+
+// Mira sempre no centro da imagem (onde fica o retículo) — aponte o celular
+// pra um detalhe de uma parede/objeto real antes de tocar em "Ancorar ponto".
+function addAnchor() {
+  const src = prevFine; // último frame já processado
+  if (!src) { flashAnchorStatus('sem imagem ainda'); return; }
+  const cx = Math.round(FINE_W/2), cy = Math.round(FINE_H/2);
+  if (cx - ANCHOR_PATCH_HALF < 0 || cx + ANCHOR_PATCH_HALF >= FINE_W ||
+      cy - ANCHOR_PATCH_HALF < 0 || cy + ANCHOR_PATCH_HALF >= FINE_H) return;
+  if (patchVariance(src, FINE_W, cx, cy) < TEXTURE_MIN_VARIANCE) {
+    flashAnchorStatus('superfície lisa demais, mire num detalhe');
+    return;
+  }
+  const patch = captureAnchorPatch(src, FINE_W, cx, cy, ANCHOR_PATCH_HALF);
+  anchors.push({ patch, yawAtCapture: yaw, health: 1.0 });
+  if (anchors.length > MAX_ANCHORS) anchors.shift();
+  if (navigator.vibrate) navigator.vibrate(25);
+  flashAnchorStatus(`ancorado (${anchors.length})`);
+}
+
+function matchAnchorPatch(anchor, img, w, h, half, searchRange) {
+  const cx = Math.round(w/2), cy = Math.round(h/2);
+  let bestDx = 0, bestDy = 0, bestScore = Infinity;
+  for (let dy = -searchRange; dy <= searchRange; dy++) {
+    const sy = cy + dy;
+    if (sy - half < 0 || sy + half >= h) continue;
+    for (let dx = -searchRange; dx <= searchRange; dx++) {
+      const sx = cx + dx;
+      if (sx - half < 0 || sx + half >= w) continue;
+      let sad = 0, k = 0;
+      for (let yy = -half; yy <= half; yy++) {
+        for (let xx = -half; xx <= half; xx++) {
+          sad += Math.abs(img[(sy+yy)*w + (sx+xx)] - anchor.patch[k++]);
+        }
+      }
+      if (sad < bestScore) { bestScore = sad; bestDx = dx; bestDy = dy; }
+    }
+  }
+  const patchSize = (half*2+1) * (half*2+1);
+  return { dx: bestDx, dy: bestDy, avgSad: bestScore / patchSize };
+}
+
+// Tenta reencontrar um ponto ancorado no frame atual (um por tick, em
+// rodízio) e usa a posição achada pra puxar o yaw de volta, corrigindo a
+// deriva acumulada desde a captura daquele ponto.
+function relocalizeWithAnchor(currFineImg) {
+  if (anchors.length === 0) return;
+  opticalTickCount++;
+  if (opticalTickCount % ANCHOR_CHECK_INTERVAL !== 0) return;
+
+  const idx = anchorCursor % anchors.length;
+  const anchor = anchors[idx];
+  anchorCursor++;
+
+  const m = matchAnchorPatch(anchor, currFineImg, FINE_W, FINE_H, ANCHOR_PATCH_HALF, ANCHOR_SEARCH_RANGE);
+  const anchorEl = document.getElementById('anchorState');
+  if (m.avgSad < ANCHOR_MATCH_THRESHOLD) {
+    const measuredYawSinceCapture = THREE.MathUtils.degToRad(-m.dx * DEG_PER_PIXEL_X);
+    const internalYawSinceCapture = yaw - anchor.yawAtCapture;
+    const driftError = internalYawSinceCapture - measuredYawSinceCapture;
+    yaw -= driftError * ANCHOR_CORRECTION_GAIN;
+    anchor.health = Math.min(1, anchor.health + 0.05);
+    if (anchorEl) anchorEl.textContent = `âncora ${idx+1}/${anchors.length} ok`;
+  } else {
+    anchor.health -= 0.12;
+    if (anchor.health <= 0) {
+      anchors.splice(idx, 1);
+      if (anchorEl) anchorEl.textContent = 'âncora perdida, removida';
+    } else if (anchorEl) {
+      anchorEl.textContent = `âncora ${idx+1}/${anchors.length} procurando...`;
+    }
+  }
+}
+
 function opticalFlowTick() {
   if (!cameraActive) return;
   fineCtx.drawImage(videoEl, 0, 0, FINE_W, FINE_H);
@@ -439,15 +542,11 @@ function opticalFlowTick() {
       prevRawPitchAtTick = rawPitch;
 
       dxHistory.push(medDx);
-      if (dxHistory.length > DX_HISTORY_SIZE) dxHistory.shift();
-      const avgAbsDx = dxHistory.reduce((a,b)=>a+Math.abs(b),0) / dxHistory.length;
-      const cameraStill = dxHistory.length === DX_HISTORY_SIZE && avgAbsDx < CAMERA_STILL_DX_LIMIT;
 
       const stillEl = document.getElementById('stillState');
-      stillEl.textContent = cameraStill ? 'parado' : `movendo (${inliers.length}/${results.length} pts)`;
+      stillEl.textContent = `${inliers.length}/${results.length} pts`;
 
-      const stillnessFactor = cameraStill ? 0.15 : 1;
-      const trust = consensus * (0.5 + 0.5*agreement) * stillnessFactor;
+      const trust = consensus * (0.5 + 0.5*agreement);
 
       const now = performance.now();
       const dt = Math.max(0.02, (now - lastYawTickTime) / 1000);
@@ -458,7 +557,7 @@ function opticalFlowTick() {
         const deltaRad = THREE.MathUtils.degToRad(deltaDeg) * trust;
         yaw += deltaRad;
         yawVelocity = yawVelocity * 0.5 + (deltaRad / dt) * 0.5;
-        if (!cameraStill) document.getElementById('modeY').textContent = 'câmera (2 camadas)';
+        document.getElementById('modeY').textContent = 'câmera (2 camadas)';
       } else {
         yawVelocity *= 0.6;
       }
@@ -469,6 +568,8 @@ function opticalFlowTick() {
       }
       wasTrackingGood = trackingGoodNow;
     }
+
+    relocalizeWithAnchor(currFine);
   }
   prevFine = currFine;
 }
@@ -551,6 +652,7 @@ function exitVrMode() {
 }
 
 document.getElementById('exitVrBtn').addEventListener('click', exitVrMode);
+document.getElementById('anchorBtn').addEventListener('click', addAnchor);
 
 let sensorsStarted = false;
 
