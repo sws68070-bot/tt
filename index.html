@@ -112,9 +112,11 @@
   <p style="font-size:11px; color:rgba(120,220,255,0.85)">
     A rotação combina o giroscópio bruto (integrado a cada frame, sem
     depender de evento algum) com a orientação absoluta fundida do celular
-    como correção lenta de deriva — filtro complementar clássico de IMU.
-    Isso acompanha giros de 360° rápidos sem travar, mesmo se a bússola
-    perder o fix por um instante.
+    como correção lenta de deriva — filtro complementar clássico de IMU, com
+    rejeição automática de leituras erradas. Quando o navegador suporta,
+    usa a Sensor API nativa (sem gimbal lock) em vez de alpha/beta/gamma.
+    Isso acompanha giros de 360° rápidos sem travar nem soluçar, mesmo se a
+    bússola perder o fix por um instante.
   </p>
   <div>
     <button id="startBtn">Ativar sensores</button>
@@ -279,6 +281,22 @@ let calibInverseQuaternion = new THREE.Quaternion(); // recentralização
 const displayQuaternion = new THREE.Quaternion(); // aplicado ao pivô, com recentralização
 const _remappedGyro = new THREE.Quaternion(); // escrátch pra remap do gyroQuaternion
 
+// ---- Rejeição de leituras fundidas ruins (o que causava o "buga no meio do 360") ----
+// A leitura "fundida" clássica (alpha/beta/gamma) é reconstruída via ângulos
+// de Euler, e no jeito que o celular fica dentro do VR box — tela virada pro
+// rosto, quase na vertical — isso cai bem perto da singularidade de gimbal
+// lock dessa decomposição. Nessa zona, uma rotação física pequena pode gerar
+// uma leitura de alpha/beta/gamma completamente errada por 1-2 eventos, e o
+// filtro complementar antigo "puxava" a rotação pra esse valor errado — daí
+// o soluço/travada bem no meio do giro de 360°. Agora cada leitura fundida é
+// comparada com o que o giroscópio (que não sofre gimbal lock) mediu no
+// mesmo intervalo; se destoar demais, a leitura é descartada nesse frame.
+const lastAcceptedFusedQuaternion = new THREE.Quaternion();
+let hasAcceptedFusedQuaternion = false;
+const _outlierCheckQuat = new THREE.Quaternion();
+let glitchRejectStreak = 0;
+let fusionSourceLabel = 'alpha/beta/gamma';
+
 // ---- Fallback (sem orientação fundida completa): pitch bruto do acelerômetro ----
 let rawPitch = 0, rawRoll = 0;
 let pitch = 0, roll = 0, yaw = 0; // usados só no modo de contingência (ver abaixo)
@@ -363,53 +381,100 @@ let hasCompassYaw = false;
 const FUSED_CORRECTION_MIN = 0.03;  // correção mínima por leitura (parado)
 const FUSED_CORRECTION_MAX = 0.18;  // correção máxima por leitura (girando rápido usa menos, pra não "puxar")
 const FUSED_SPEED_FOR_MIN_CORRECTION = THREE.MathUtils.degToRad(120); // acima disso, correção fica no mínimo
-const FUSED_STALL_MS = 220; // se a leitura fundida atrasar mais que isso, ela "pesa mais" quando finalmente chega
+const FUSED_STALL_MS = 220; // acima disso a leitura é considerada "atrasada"
+const GLITCH_MIN_ANGLE = THREE.MathUtils.degToRad(18); // abaixo disso nunca é considerado glitch
+const GLITCH_DISAGREEMENT = THREE.MathUtils.degToRad(14); // divergência vs. giroscópio pra rejeitar
+const GLITCH_MAX_STREAK = 6; // depois de tantas rejeições seguidas, aceita mesmo assim (evita travar de vez)
 
-function handleOrientation(e) {
-  if (typeof e.alpha === 'number' && typeof e.beta === 'number' && typeof e.gamma === 'number') {
-    computeRawDeviceQuaternion(e.alpha, e.beta, e.gamma, _rawFusedQuaternion);
-    sensorQuaternion.copy(_rawFusedQuaternion); // mantido pra compat (HUD/recentralizar)
+// feedFusedReading: recebe um quaternion "cru" (mesmo espaço de gyroQuaternion,
+// antes do remap de tela) vindo de QUALQUER fonte fundida — tanto o clássico
+// alpha/beta/gamma quanto a Sensor API nativa — e aplica o filtro complementar
+// com rejeição de outliers. Compartilhado pelas duas fontes pra não duplicar
+// a lógica de correção/anti-glitch.
+function feedFusedReading(rawQuat, now) {
+  const dt = Math.max(0.004, (now - lastOrientationTickTime) / 1000);
+  const sinceLastFused = lastFusedUpdateTime ? (now - lastFusedUpdateTime) : 0;
+  lastOrientationTickTime = now;
+  lastFusedUpdateTime = now;
 
-    const now = performance.now();
-    const dt = Math.max(0.004, (now - lastOrientationTickTime) / 1000);
-    const sinceLastFused = lastFusedUpdateTime ? (now - lastFusedUpdateTime) : 0;
-    lastOrientationTickTime = now;
-    lastFusedUpdateTime = now;
+  if (!hasGyroQuaternion) {
+    // primeira leitura: giroscópio parte exatamente da orientação fundida
+    gyroQuaternion.copy(rawQuat);
+    hasGyroQuaternion = true;
+    hasSensorQuaternion = true;
+    lastAcceptedFusedQuaternion.copy(rawQuat);
+    hasAcceptedFusedQuaternion = true;
+  } else {
+    // ---- Checagem de outlier ANTES de corrigir ----
+    // Compara o quanto essa leitura fundida diz que o aparelho girou desde a
+    // última leitura ACEITA contra o quanto o giroscópio (sem gimbal lock)
+    // mediu no mesmo intervalo. Se as duas contam histórias muito diferentes,
+    // a leitura fundida é o problema (gimbal lock perto de beta≈90° dentro
+    // do VR box, ou bússola perdendo o fix perto do ímã/metal do visor) —
+    // ela é descartada nesse frame em vez de "puxar" a cena pra um valor
+    // errado, que era exatamente o soluço/travada no meio do giro de 360°.
+    let isGlitch = false;
+    if (hasAcceptedFusedQuaternion) {
+      _outlierCheckQuat.copy(lastAcceptedFusedQuaternion).invert().multiply(rawQuat);
+      const impliedAngle = 2 * Math.acos(THREE.MathUtils.clamp(Math.abs(_outlierCheckQuat.w), -1, 1));
+      const gyroImpliedAngle = sensorAngularSpeed * (sinceLastFused > 0 ? sinceLastFused / 1000 : dt);
+      const disagreement = Math.abs(impliedAngle - gyroImpliedAngle);
+      isGlitch = impliedAngle > GLITCH_MIN_ANGLE && disagreement > GLITCH_DISAGREEMENT;
+    }
 
-    if (!hasGyroQuaternion) {
-      // primeira leitura: giroscópio parte exatamente da orientação fundida
-      gyroQuaternion.copy(_rawFusedQuaternion);
-      hasGyroQuaternion = true;
-      hasSensorQuaternion = true;
+    if (isGlitch && glitchRejectStreak < GLITCH_MAX_STREAK) {
+      glitchRejectStreak++;
+      // ignora a leitura ruim — o giroscópio sozinho já mantém a cena girando liso
     } else {
+      glitchRejectStreak = 0;
       // Filtro complementar: puxa o giroscópio integrado de volta pro valor
       // absoluto aos poucos. Girando rápido, puxa pouco (evita "puxão"/
       // desvio lateral); parado ou devagar, puxa mais forte (mata a deriva
       // acumulada do giroscópio, que sozinho deriva com o tempo).
-      // Se a leitura atrasou (stall de bússola), dá um empurrão extra
-      // proporcional ao atraso pra recolocar o giroscópio nos trilhos.
       const speedFactor = THREE.MathUtils.clamp(sensorAngularSpeed / FUSED_SPEED_FOR_MIN_CORRECTION, 0, 1);
       let correction = THREE.MathUtils.lerp(FUSED_CORRECTION_MAX, FUSED_CORRECTION_MIN, speedFactor);
-      if (sinceLastFused > FUSED_STALL_MS) {
-        correction = Math.min(0.6, correction + (sinceLastFused - FUSED_STALL_MS) / 1000);
+      // Leitura atrasada: só reforça a correção se o aparelho estava QUASE
+      // PARADO enquanto esperava (deriva legítima acumulando devagar). Se
+      // estava girando rápido, uma leitura atrasada é justamente a mais
+      // suspeita de ser stale/glitch — empurrar mais forte nesse caso é o
+      // que causava o "puxão" no meio do giro. Então NÃO reforça.
+      if (sinceLastFused > FUSED_STALL_MS && speedFactor < 0.25) {
+        correction = Math.min(0.5, correction + (sinceLastFused - FUSED_STALL_MS) / 1000);
       }
-      gyroQuaternion.slerp(_rawFusedQuaternion, correction);
+      gyroQuaternion.slerp(rawQuat, correction);
+      lastAcceptedFusedQuaternion.copy(rawQuat);
+      hasAcceptedFusedQuaternion = true;
     }
+  }
 
-    if (hasSensorQuaternion) {
-      // ângulo entre a leitura anterior e a atual -> velocidade angular real
-      // (só usado aqui como referência adicional; a fonte principal de
-      // sensorAngularSpeed agora é o rotationRate em handleMotion)
-      const dq = lastSensorQuaternion.clone().invert().multiply(_rawFusedQuaternion);
-      const w = THREE.MathUtils.clamp(Math.abs(dq.w), -1, 1);
-      const angle = 2 * Math.acos(w);
-      const instSpeed = angle / dt;
-      if (instSpeed < THREE.MathUtils.degToRad(400)) {
-        // ignora picos absurdos (ex: leitura atrasada acumulando ângulo)
-        sensorAngularSpeed = sensorAngularSpeed * 0.85 + instSpeed * 0.15;
-      }
+  if (hasSensorQuaternion) {
+    // ângulo entre a leitura anterior e a atual -> velocidade angular real
+    // (só usado aqui como referência adicional; a fonte principal de
+    // sensorAngularSpeed agora é o rotationRate em handleMotion)
+    const dq = lastSensorQuaternion.clone().invert().multiply(rawQuat);
+    const w = THREE.MathUtils.clamp(Math.abs(dq.w), -1, 1);
+    const angle = 2 * Math.acos(w);
+    const instSpeed = angle / dt;
+    if (instSpeed < THREE.MathUtils.degToRad(400)) {
+      // ignora picos absurdos (ex: leitura atrasada acumulando ângulo)
+      sensorAngularSpeed = sensorAngularSpeed * 0.85 + instSpeed * 0.15;
     }
-    lastSensorQuaternion.copy(_rawFusedQuaternion);
+  }
+  lastSensorQuaternion.copy(rawQuat);
+}
+
+function handleOrientation(e) {
+  if (typeof e.alpha === 'number' && typeof e.beta === 'number' && typeof e.gamma === 'number') {
+    // Se a Sensor API nativa já está ativa, ela é a fonte principal (sem
+    // gimbal lock); o alpha/beta/gamma clássico só entra se ela não existir.
+    if (fusionSourceLabel === 'sensor-api-nativa') {
+      // ainda assim mantém sensorQuaternion/HUD atualizados pra debug
+      computeRawDeviceQuaternion(e.alpha, e.beta, e.gamma, sensorQuaternion);
+    } else {
+      computeRawDeviceQuaternion(e.alpha, e.beta, e.gamma, _rawFusedQuaternion);
+      sensorQuaternion.copy(_rawFusedQuaternion);
+      feedFusedReading(_rawFusedQuaternion, performance.now());
+    }
   }
 
   // bússola crua — só vira o driver de yaw se o quaternion fundido nunca chegar
@@ -417,6 +482,50 @@ function handleOrientation(e) {
     yawCompassRaw = THREE.MathUtils.degToRad(360 - e.alpha);
     hasCompassYaw = true;
     if (yawCompassOffset === null) yawCompassOffset = yaw - yawCompassRaw;
+  }
+}
+
+// ================= Sensor API nativa (AbsoluteOrientationSensor) =================
+// Quando disponível, essa API entrega o quaternion de orientação já fundido
+// PELO PRÓPRIO SISTEMA — sem nunca passar por uma decomposição em ângulos de
+// Euler (alpha/beta/gamma). Isso elimina de vez a causa raiz do gimbal lock
+// que acontecia exatamente na pose "celular na vertical, tela virada pro
+// rosto" usada dentro de um VR box. É o upgrade mais robusto possível pro
+// "giroscópio" do app: mesma integração de giroscópio bruto de antes, mas
+// agora corrigida por uma fonte fundida que não pode gerar aquele tipo de
+// leitura errática durante um giro rápido.
+let nativeSensor = null;
+
+async function tryStartNativeSensor() {
+  if (typeof AbsoluteOrientationSensor === 'undefined') return false;
+  try {
+    const perms = await Promise.all([
+      navigator.permissions ? navigator.permissions.query({ name: 'accelerometer' }).catch(() => null) : null,
+      navigator.permissions ? navigator.permissions.query({ name: 'gyroscope' }).catch(() => null) : null,
+      navigator.permissions ? navigator.permissions.query({ name: 'magnetometer' }).catch(() => null) : null,
+    ]);
+    if (perms.some(p => p && p.state === 'denied')) return false;
+
+    nativeSensor = new AbsoluteOrientationSensor({ frequency: 60, referenceFrame: 'device' });
+    let sawReading = false;
+    nativeSensor.addEventListener('reading', () => {
+      sawReading = true;
+      const q = nativeSensor.quaternion; // [x, y, z, w], mesmo espaço "cru" do aparelho
+      _rawFusedQuaternion.set(q[0], q[1], q[2], q[3]);
+      sensorQuaternion.copy(_rawFusedQuaternion);
+      feedFusedReading(_rawFusedQuaternion, performance.now());
+    });
+    nativeSensor.addEventListener('error', (ev) => {
+      console.warn('AbsoluteOrientationSensor erro, voltando pro alpha/beta/gamma:', ev.error && ev.error.name);
+      fusionSourceLabel = 'alpha/beta/gamma';
+      try { nativeSensor.stop(); } catch (_) {}
+    });
+    nativeSensor.start();
+    fusionSourceLabel = 'sensor-api-nativa';
+    return true;
+  } catch (err) {
+    console.warn('Sensor API nativa indisponível, usando alpha/beta/gamma:', err);
+    return false;
   }
 }
 
@@ -816,6 +925,7 @@ async function startSensors() {
     window.addEventListener('deviceorientation', handleOrientation, true);
   }
   window.addEventListener('devicemotion', handleMotion, true);
+  await tryStartNativeSensor(); // tenta o caminho sem gimbal lock primeiro
   await startCamera();
   await requestWakeLock();
   sensorsStarted = true;
@@ -861,8 +971,9 @@ function animate() {
     neckPivot.quaternion.slerp(displayQuaternion, 0.75);
     displaySpeedRad = sensorAngularSpeed;
 
+    const glitchTag = glitchRejectStreak > 0 ? ` · ignorando leitura ruim (${glitchRejectStreak})` : '';
     document.getElementById('modeY').textContent =
-      `giroscópio integrado + correção fundida${cameraActive ? ' · câmera em standby' : ''}`;
+      `giroscópio + ${fusionSourceLabel}${glitchTag}${cameraActive ? ' · câmera em standby' : ''}`;
 
     _hudEuler.setFromQuaternion(neckPivot.quaternion, 'YXZ');
     document.getElementById('y').textContent = THREE.MathUtils.radToDeg(_hudEuler.y).toFixed(1);
