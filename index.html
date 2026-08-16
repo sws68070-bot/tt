@@ -98,6 +98,7 @@
 <div id="topControls">
   <button id="calibBtn">Recentralizar</button>
   <button id="invertYawBtn">Inverter horiz.</button>
+  <button id="invertPitchBtn">Inverter vert.</button>
   <button id="exitVrBtn" style="display:none">Sair do VR</button>
 </div>
 
@@ -244,16 +245,21 @@ function computeRawDeviceQuaternion(alphaDeg, betaDeg, gammaDeg, target) {
 // lugar por onde passam TODOS os caminhos de orientação (giroscópio puro,
 // giroscópio+fusão, e sem-giroscópio), então corrige tudo de uma vez.
 let invertYaw = false;
-try { invertYaw = localStorage.getItem('vrbox_invertYaw') === '1'; } catch (e) {}
+let invertPitch = false;
+try {
+  invertYaw = localStorage.getItem('vrbox_invertYaw') === '1';
+  invertPitch = localStorage.getItem('vrbox_invertPitch') === '1';
+} catch (e) {}
 const _invertEuler = new THREE.Euler();
 
 function applyDisplayRemap(rawQuaternion, target) {
   target.copy(rawQuaternion);
   target.multiply(_q1);
   target.multiply(_q0.setFromAxisAngle(_zeeAxis, -screenOrientRad()));
-  if (invertYaw) {
+  if (invertYaw || invertPitch) {
     _invertEuler.setFromQuaternion(target, 'YXZ');
-    _invertEuler.y = -_invertEuler.y;
+    if (invertYaw) _invertEuler.y = -_invertEuler.y;
+    if (invertPitch) _invertEuler.x = -_invertEuler.x;
     target.setFromEuler(_invertEuler);
   }
   return target;
@@ -537,8 +543,8 @@ async function tryStartNativeSensor() {
 //  6. Saúde por ponto (health) ainda soma/decai com o consenso, então
 //     pontos ruins somem aos poucos da estimativa sem descartar tudo de vez.
 
-const FINE_W = 72, FINE_H = 54;      // nível fino da pirâmide
-const COARSE_W = FINE_W >> 1, COARSE_H = FINE_H >> 1; // nível grosseiro (36×27)
+const FINE_W = 96, FINE_H = 72;      // nível fino da pirâmide
+const COARSE_W = FINE_W >> 1, COARSE_H = FINE_H >> 1; // nível grosseiro (48×36)
 
 const FOV_H_DEG = 60;
 const FOV_V_DEG = FOV_H_DEG * (FINE_H / FINE_W);
@@ -552,12 +558,28 @@ const CONSENSUS_TOLERANCE_PX = 1.4;
 const REFINE_CONSENSUS_TOLERANCE_PX = 0.9;
 const RANSAC_ITERATIONS = 40;
 
-const GRID_COLS = 18, GRID_ROWS = 13;
+const GRID_COLS = 26, GRID_ROWS = 19; // grade densa: quase varre pixel a pixel dentro do orçamento de tempo
 const CELL_MARGIN = PATCH_HALF + 2;
-const MAX_ACTIVE_POINTS = 90;
-const MIN_ACTIVE_POINTS = 10;
-const MIN_POINT_SEPARATION = 2.8;
-const CORNER_SCORE_THRESHOLD = 60; // ajuste conforme a cena/câmera se ficar sensível/insensível demais
+const MAX_ACTIVE_POINTS = 180;
+const MIN_ACTIVE_POINTS = 12;
+const MIN_POINT_SEPARATION = 2.0;
+
+// ---- Múltiplos filtros de detecção (em vez de só "é um canto?") ----
+// Cada célula da grade passa por 3 testes independentes; basta PASSAR EM
+// QUALQUER UM deles (OR, não AND) pra virar candidato. Isso pega tipos de
+// textura bem diferentes que um filtro sozinho perderia:
+//  - CORNER: cantos/junções nítidas (Shi-Tomasi) — o mais confiável.
+//  - EDGE: magnitude de borda média (Sobel) — pega bordas retas e contínuas
+//    (quina de parede, horizonte, moldura) que não são "cantos" mas ainda
+//    dão bom sinal de movimento numa direção.
+//  - VARIANCE: contraste bruto do patch — pega textura fraca e difusa
+//    (nuvem no céu, textura de carpete, grão de parede) que nem forma
+//    canto nem borda definida, mas ainda muda o suficiente pra rastrear.
+// Ajuste os limiares abaixo se a cena estiver gerando pontos demais (ruído)
+// ou de menos (perdendo textura sutil).
+const CORNER_SCORE_THRESHOLD = 22;
+const EDGE_SCORE_THRESHOLD = 3.2;
+const VARIANCE_SCORE_THRESHOLD = 10;
 const MAX_CAMERA_YAW_STEP_RAD = THREE.MathUtils.degToRad(6);
 const MAX_PLAUSIBLE_TICK_SPEED_RAD = THREE.MathUtils.degToRad(700);
 
@@ -579,7 +601,7 @@ let pointState = new Map();
 let cameraActive = false;
 let opticalFlowLoopActive = false;
 let lastOpticalFlowTickTime = 0;
-const OPTICAL_FLOW_MIN_INTERVAL_MS = 70;
+const OPTICAL_FLOW_MIN_INTERVAL_MS = 90; // maior resolução + mais pontos = mais trabalho por tick
 const videoEl = document.getElementById('camPreview');
 const trackCanvas = document.getElementById('trackCanvas');
 trackCanvas.width = FINE_W; trackCanvas.height = FINE_H;
@@ -637,24 +659,36 @@ function computeGradients(gray, w, h) {
   return { gx, gy };
 }
 
-// Score de canto Shi-Tomasi: menor autovalor do tensor de estrutura local.
-// Alto nos dois eixos ao mesmo tempo = canto real (bom pra rastrear).
-// Alto só num eixo = borda (ambígua ao longo da própria direção).
-// Baixo nos dois = área lisa (parede sem textura, céu limpo).
-function cornerScoreAt(gx, gy, w, cx, cy, half) {
-  let sxx = 0, syy = 0, sxy = 0;
+// Calcula os 3 filtros de uma vez, num único passe sobre o patch:
+//  - cornerScore: menor autovalor do tensor de estrutura (Shi-Tomasi).
+//    Alto nos dois eixos ao mesmo tempo = canto real. Alto só num eixo =
+//    borda (ambígua ao longo da própria direção). Baixo nos dois = área lisa.
+//  - edgeScore: magnitude média do gradiente (força de borda, tipo Sobel),
+//    pega bordas retas mesmo quando não formam canto.
+//  - varianceScore: contraste bruto do patch (intensidade, não gradiente),
+//    pega textura difusa que nem chega a formar borda clara.
+function multiFilterScoreAt(gx, gy, gray, w, cx, cy, half) {
+  let sxx = 0, syy = 0, sxy = 0, sumMag = 0;
+  let sum = 0, sumSq = 0, n = 0;
   for (let yy = -half; yy <= half; yy++) {
     const row = (cy + yy) * w;
     for (let xx = -half; xx <= half; xx++) {
       const i = row + cx + xx;
       const ix = gx[i], iy = gy[i];
       sxx += ix * ix; syy += iy * iy; sxy += ix * iy;
+      sumMag += Math.sqrt(ix * ix + iy * iy);
+      const v = gray[i];
+      sum += v; sumSq += v * v; n++;
     }
   }
   const trace = sxx + syy;
   const det = sxx * syy - sxy * sxy;
   const disc = Math.sqrt(Math.max(0, trace*trace/4 - det));
-  return trace / 2 - disc;
+  const cornerScore = trace / 2 - disc;
+  const edgeScore = sumMag / n;
+  const mean = sum / n;
+  const varianceScore = sumSq / n - mean * mean;
+  return { cornerScore, edgeScore, varianceScore };
 }
 
 function patchMean(img, w, cx, cy, half) {
@@ -795,13 +829,24 @@ function feedCameraYawCorrection(deltaRad) {
   gyroQuaternion.multiply(_cameraCorrectionQuat);
 }
 
-// Seleciona pontos candidatos por score de canto (Shi-Tomasi), com
-// supressão de não-máximos por distância mínima entre pontos escolhidos.
-function selectActivePoints(gx, gy) {
+// Seleciona pontos candidatos: uma célula entra na disputa se PASSAR EM
+// QUALQUER UM dos 3 filtros (canto, borda ou variância) — é o "detectar
+// tudo, até textura sutil" que os filtros combinados permitem. O score
+// combinado (ponderado, dando mais peso pra canto por ser mais confiável)
+// só decide a PRIORIDADE de quem entra primeiro quando o orçamento de
+// pontos (MAX_ACTIVE_POINTS) fica cheio — supressão de não-máximos por
+// distância mínima evita pontos redundantes colados uns nos outros.
+function selectActivePoints(gx, gy, gray) {
   const scored = [];
   for (const cell of CANDIDATE_CELLS) {
-    const score = cornerScoreAt(gx, gy, FINE_W, cell.x, cell.y, PATCH_HALF);
-    if (score >= CORNER_SCORE_THRESHOLD) scored.push({ cell, score });
+    const { cornerScore, edgeScore, varianceScore } = multiFilterScoreAt(gx, gy, gray, FINE_W, cell.x, cell.y, PATCH_HALF);
+    const passesCorner = cornerScore >= CORNER_SCORE_THRESHOLD;
+    const passesEdge = edgeScore >= EDGE_SCORE_THRESHOLD;
+    const passesVariance = varianceScore >= VARIANCE_SCORE_THRESHOLD;
+    if (!passesCorner && !passesEdge && !passesVariance) continue;
+    const combined = cornerScore * 1.0 + edgeScore * 8.0 + varianceScore * 0.4
+      + (passesCorner ? 200 : 0); // cantos sobem na fila de prioridade por serem mais confiáveis
+    scored.push({ cell, score: combined });
   }
   scored.sort((a, b) => b.score - a.score);
 
@@ -837,7 +882,7 @@ function opticalFlowTick() {
 
   if (prevPyr) {
     const { gx, gy } = computeGradients(currPyrFine, FINE_W, FINE_H);
-    const activePoints = selectActivePoints(gx, gy);
+    const activePoints = selectActivePoints(gx, gy, currPyrFine);
 
     const results = [];
     for (const cell of activePoints) {
@@ -980,6 +1025,24 @@ invertYawBtn.addEventListener('click', () => {
   try { localStorage.setItem('vrbox_invertYaw', invertYaw ? '1' : '0'); } catch (e) {}
   refreshInvertYawBtn();
   // Recalibra na hora pra não dar um salto visual quando o sinal do yaw muda.
+  if (hasGyroQuaternion) {
+    applyDisplayRemap(gyroQuaternion, _remappedGyro);
+    calibInverseQuaternion.copy(_remappedGyro).invert();
+  }
+  if (navigator.vibrate) navigator.vibrate(20);
+});
+
+const invertPitchBtn = document.getElementById('invertPitchBtn');
+function refreshInvertPitchBtn() {
+  invertPitchBtn.style.background = invertPitch ? 'rgba(255,176,32,0.85)' : 'rgba(255,255,255,0.08)';
+  invertPitchBtn.style.color = invertPitch ? '#071018' : '#fff';
+  invertPitchBtn.textContent = invertPitch ? 'Inverter vert. ✓' : 'Inverter vert.';
+}
+refreshInvertPitchBtn();
+invertPitchBtn.addEventListener('click', () => {
+  invertPitch = !invertPitch;
+  try { localStorage.setItem('vrbox_invertPitch', invertPitch ? '1' : '0'); } catch (e) {}
+  refreshInvertPitchBtn();
   if (hasGyroQuaternion) {
     applyDisplayRemap(gyroQuaternion, _remappedGyro);
     calibInverseQuaternion.copy(_remappedGyro).invert();
@@ -1132,8 +1195,10 @@ function animate() {
     const dtFrame = Math.min(0.05, (performance.now() - lastYawTickTime) / 1000);
     const yawExtrapolated = yaw + yawVelocity * dtFrame * 0.4;
 
-    neckPivot.rotation.y += (yawExtrapolated - neckPivot.rotation.y) * 0.55;
-    neckPivot.rotation.x += (pitch - neckPivot.rotation.x) * 0.5;
+    const yawExtrapolatedSigned = invertYaw ? -yawExtrapolated : yawExtrapolated;
+    const pitchSigned = invertPitch ? -pitch : pitch;
+    neckPivot.rotation.y += (yawExtrapolatedSigned - neckPivot.rotation.y) * 0.55;
+    neckPivot.rotation.x += (pitchSigned - neckPivot.rotation.x) * 0.5;
     neckPivot.rotation.z += (roll - neckPivot.rotation.z) * 0.5;
     neckPivot.quaternion.setFromEuler(neckPivot.rotation);
 
