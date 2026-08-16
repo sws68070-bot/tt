@@ -53,11 +53,13 @@
 
   #topControls {
     position: fixed; top: 8px; right: 8px; z-index: 6;
-    display: flex; gap: 6px;
+    display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 6px;
+    max-width: 60vw;
   }
   #topControls button {
-    padding: 7px 10px; border-radius: 6px; border: 1px solid rgba(255,255,255,0.2);
+    padding: 7px 9px; border-radius: 6px; border: 1px solid rgba(255,255,255,0.2);
     background: rgba(255,255,255,0.08); color: #fff; font-size: 10px;
+    white-space: nowrap;
   }
 
   #camPreview {
@@ -90,11 +92,12 @@
 </div>
 <div id="reticle"></div>
 <video id="camPreview" playsinline autoplay muted></video>
-<canvas id="trackCanvas" width="48" height="36"></canvas>
+<canvas id="trackCanvas" width="72" height="54"></canvas>
 <div id="eyeDivider"></div>
 
 <div id="topControls">
   <button id="calibBtn">Recentralizar</button>
+  <button id="invertYawBtn">Inverter horiz.</button>
   <button id="exitVrBtn" style="display:none">Sair do VR</button>
 </div>
 
@@ -110,13 +113,12 @@
     encaixe no visor.
   </p>
   <p style="font-size:11px; color:rgba(120,220,255,0.85)">
-    A rotação combina o giroscópio bruto (integrado a cada frame, sem
-    depender de evento algum) com a orientação absoluta fundida do celular
-    como correção lenta de deriva — filtro complementar clássico de IMU, com
-    rejeição automática de leituras erradas. Quando o navegador suporta,
-    usa a Sensor API nativa (sem gimbal lock) em vez de alpha/beta/gamma.
-    Isso acompanha giros de 360° rápidos sem travar nem soluçar, mesmo se a
-    bússola perder o fix por um instante.
+    A rotação combina o giroscópio bruto (integrado a cada frame) com a
+    orientação absoluta fundida do celular como correção lenta de deriva —
+    filtro complementar clássico de IMU. A câmera reforça o yaw usando
+    rastreamento óptico multi-escala com detecção de cantos e consenso por
+    RANSAC, funcionando em qualquer cena (parede, céu, chão, o que a câmera
+    enxergar) desde que haja alguma textura.
   </p>
   <div>
     <button id="startBtn">Ativar sensores</button>
@@ -234,10 +236,26 @@ function computeRawDeviceQuaternion(alphaDeg, betaDeg, gammaDeg, target) {
   return target;
 }
 
+// Em alguns aparelhos (varia por navegador/Android vs iOS) o ângulo de
+// orientação de tela ou a convenção do sensor vem com o sinal trocado, e o
+// giro pra direita faz a cena virar pra esquerda (e vice-versa). Em vez de
+// tentar adivinhar a convenção certa pra cada aparelho, existe um toggle
+// que espelha só o eixo de yaw (horizontal) — aplicado aqui, no único
+// lugar por onde passam TODOS os caminhos de orientação (giroscópio puro,
+// giroscópio+fusão, e sem-giroscópio), então corrige tudo de uma vez.
+let invertYaw = false;
+try { invertYaw = localStorage.getItem('vrbox_invertYaw') === '1'; } catch (e) {}
+const _invertEuler = new THREE.Euler();
+
 function applyDisplayRemap(rawQuaternion, target) {
   target.copy(rawQuaternion);
   target.multiply(_q1);
   target.multiply(_q0.setFromAxisAngle(_zeeAxis, -screenOrientRad()));
+  if (invertYaw) {
+    _invertEuler.setFromQuaternion(target, 'YXZ');
+    _invertEuler.y = -_invertEuler.y;
+    target.setFromEuler(_invertEuler);
+  }
   return target;
 }
 
@@ -258,18 +276,6 @@ let sensorAngularSpeed = 0; // rad/s — velocidade real de giro do aparelho
 let lastOrientationTickTime = performance.now();
 
 // ---- Aparelho sem giroscópio físico ----
-// Em vez de tentar "integrar" alguma coisa que não existe, quando o
-// aparelho não tem giroscópio (e.rotationRate nunca vem preenchido) a
-// orientação passa a ser recalculada INTEIRA a cada leitura, a partir de
-// duas fontes absolutas (sem deriva pra acumular):
-//   - pitch/roll: inclinação medida direto pelo acelerômetro (gravidade)
-//   - yaw: só a câmera consegue medir giro em torno do eixo vertical,
-//     então vira um ângulo acumulado só por ela
-// O quaternion final é montado com a MESMA função computeRawDeviceQuaternion
-// já usada pro alpha/beta/gamma do sensor fundido, então reaproveita 100%
-// do pipeline de remap/exibição — o app nunca mais passa pelo caminho de
-// Euler separado (neckPivot.rotation.x/y/z + setFromEuler) que causava o
-// travamento perto da "linha do meio".
 let gyroRotationRateSeen = false;
 let isNoGyroDevice = false;
 let accelSampleCount = 0;
@@ -321,16 +327,6 @@ function handleMotion(e) {
   if (rr && (typeof rr.alpha === 'number' || typeof rr.beta === 'number' || typeof rr.gamma === 'number')) {
     gyroRotationRateSeen = true;
     isNoGyroDevice = false;
-    // Auto-inicialização: não espera mais nenhuma leitura fundida
-    // (deviceorientation) pra começar a integrar. Em aparelhos onde esse
-    // evento nunca dispara (sem magnetômetro calibrado, WebView limitada,
-    // permissão negada só pra orientation mas não pra motion, etc.) o app
-    // ficava preso pra sempre no modo de contingência por ângulos de Euler
-    // separados — que É o mesmo tipo de gimbal lock que o giroscópio foi
-    // criado pra evitar. Agora o giroscópio parte sozinho da identidade
-    // (ou de uma estimativa inicial vinda do acelerômetro, ver abaixo) e o
-    // caminho principal do animate() passa a rodar desde o primeiro evento
-    // devicemotion, com ou sem bússola.
     if (!hasGyroQuaternion) {
       gyroQuaternion.identity();
       hasGyroQuaternion = true;
@@ -377,9 +373,6 @@ function handleMotion(e) {
   pitch = THREE.MathUtils.clamp(rawPitch - pitchOffset, -MAX_PITCH, MAX_PITCH);
   roll = THREE.MathUtils.clamp(rawRoll - rollOffset, -MAX_ROLL, MAX_ROLL);
 
-  // Depois de alguns eventos devicemotion sem NUNCA ver rotationRate
-  // preenchido, dá pra concluir com segurança que esse aparelho não tem
-  // giroscópio físico — troca de vez pro modo acelerômetro+câmera.
   if (!gyroRotationRateSeen && !isNoGyroDevice && accelSampleCount >= NO_GYRO_GRACE_SAMPLES) {
     isNoGyroDevice = true;
   }
@@ -514,24 +507,57 @@ async function tryStartNativeSensor() {
   }
 }
 
-// ================= Câmera: reforço leve/opcional pro yaw =================
-const FINE_W = 48, FINE_H = 36;
+// ======================================================================
+// ================= Câmera: rastreamento óptico robusto =================
+// ======================================================================
+//
+// Pipeline (roda a cada ~70ms):
+//  1. Frame reduzido a tons de cinza em dois níveis: fino (72×54) e
+//     grosseiro (36×27, metade da resolução) — pirâmide de imagem.
+//  2. Seleção de pontos: em vez de confiar só em "tem contraste" (variância),
+//     calcula um score de canto (Shi-Tomasi, autovalor mínimo do tensor de
+//     estrutura a partir dos gradientes Sobel/central). Isso favorece
+//     cantos e junções reais — muito mais estável pra rastrear do que bordas
+//     lisas — e funciona igual em parede, céu com nuvem, teto, carpete etc.,
+//     desde que haja QUALQUER textura na cena.
+//  3. Casamento de cada ponto por diamond search (mesma ideia de motion
+//     estimation de vídeo), mas em DUAS ESCALAS: primeiro busca grosseira na
+//     imagem reduzida pela metade (aguenta deslocamentos ~2x maiores pro
+//     mesmo número de passos), e o resultado vira semente pra um refino fino
+//     na resolução normal. Isso é o que resolve "perder o rastreamento" em
+//     giros rápidos.
+//  4. Comparação de patches com SAD normalizado pela média local do próprio
+//     patch (zero-mean SAD) — deixa a busca imune a mudanças de exposição
+//     automática da câmera entre um frame e outro.
+//  5. Consenso robusto por RANSAC: em vez de só tirar a mediana de todos os
+//     deslocamentos, sorteia hipóteses, conta quantos pontos concordam
+//     com cada uma e fica com a que tiver mais "votos" — muito mais robusto
+//     que mediana simples quando um pedaço grande da cena se move sozinho
+//     (uma pessoa passando, uma sombra, um objeto próximo com paralaxe).
+//  6. Saúde por ponto (health) ainda soma/decai com o consenso, então
+//     pontos ruins somem aos poucos da estimativa sem descartar tudo de vez.
+
+const FINE_W = 72, FINE_H = 54;      // nível fino da pirâmide
+const COARSE_W = FINE_W >> 1, COARSE_H = FINE_H >> 1; // nível grosseiro (36×27)
+
 const FOV_H_DEG = 60;
 const FOV_V_DEG = FOV_H_DEG * (FINE_H / FINE_W);
 const DEG_PER_PIXEL_X = FOV_H_DEG / FINE_W;
 const DEG_PER_PIXEL_Y = FOV_V_DEG / FINE_H;
 const AGREEMENT_TOLERANCE_PX = 3.5;
 
-const PATCH_HALF = 3;
+const PATCH_HALF = 3;          // patch fino 7×7
+const PATCH_HALF_COARSE = 2;   // patch grosseiro 5×5
 const CONSENSUS_TOLERANCE_PX = 1.4;
 const REFINE_CONSENSUS_TOLERANCE_PX = 0.9;
+const RANSAC_ITERATIONS = 40;
 
-const GRID_COLS = 14, GRID_ROWS = 10;
-const CELL_MARGIN = PATCH_HALF + 1;
-const MAX_ACTIVE_POINTS = 60;
-const MIN_ACTIVE_POINTS = 8;
-const MIN_POINT_SEPARATION = 2.4;
-const VARIANCE_FILTER_THRESHOLD = 45;
+const GRID_COLS = 18, GRID_ROWS = 13;
+const CELL_MARGIN = PATCH_HALF + 2;
+const MAX_ACTIVE_POINTS = 90;
+const MIN_ACTIVE_POINTS = 10;
+const MIN_POINT_SEPARATION = 2.8;
+const CORNER_SCORE_THRESHOLD = 60; // ajuste conforme a cena/câmera se ficar sensível/insensível demais
 const MAX_CAMERA_YAW_STEP_RAD = THREE.MathUtils.degToRad(6);
 const MAX_PLAUSIBLE_TICK_SPEED_RAD = THREE.MathUtils.degToRad(700);
 
@@ -556,12 +582,14 @@ let lastOpticalFlowTickTime = 0;
 const OPTICAL_FLOW_MIN_INTERVAL_MS = 70;
 const videoEl = document.getElementById('camPreview');
 const trackCanvas = document.getElementById('trackCanvas');
+trackCanvas.width = FINE_W; trackCanvas.height = FINE_H;
 const trackCtx = trackCanvas.getContext('2d');
 
 const fineCanvas = document.createElement('canvas');
 fineCanvas.width = FINE_W; fineCanvas.height = FINE_H;
 const fineCtx = fineCanvas.getContext('2d', { willReadFrequently: true });
-let prevFine = null;
+
+let prevPyr = null; // { fine: Float32Array, coarse: Float32Array }
 
 let predictedDx = 0, predictedDy = 0;
 let dxHistory = [];
@@ -577,43 +605,80 @@ function toGray(ctx, w, h) {
   return gray;
 }
 
-function buildIntegral(gray, w, h) {
-  const stride = w + 1;
-  const integral = new Float64Array(stride * (h + 1));
-  const integralSq = new Float64Array(stride * (h + 1));
-  for (let y = 0; y < h; y++) {
-    let rowSum = 0, rowSumSq = 0;
-    const rowAbove = y * stride;
-    const rowHere = (y + 1) * stride;
-    for (let x = 0; x < w; x++) {
-      const v = gray[y * w + x];
-      rowSum += v; rowSumSq += v * v;
-      integral[rowHere + x + 1] = integral[rowAbove + x + 1] + rowSum;
-      integralSq[rowHere + x + 1] = integralSq[rowAbove + x + 1] + rowSumSq;
+// Reduz a imagem à metade, calculando a média de blocos 2×2 — nível
+// grosseiro da pirâmide, usado pra busca de longo alcance.
+function downsample2x(src, w, h) {
+  const outW = w >> 1, outH = h >> 1;
+  const out = new Float32Array(outW * outH);
+  for (let y = 0; y < outH; y++) {
+    const sy = y * 2;
+    for (let x = 0; x < outW; x++) {
+      const sx = x * 2;
+      out[y*outW + x] = (
+        src[sy*w + sx] + src[sy*w + sx+1] +
+        src[(sy+1)*w + sx] + src[(sy+1)*w + sx+1]
+      ) * 0.25;
     }
   }
-  return { integral, integralSq, stride };
+  return out;
 }
 
-function boxVariance(ii, cx, cy, half) {
-  const { integral, integralSq, stride } = ii;
-  const x0 = cx - half, x1 = cx + half + 1, y0 = cy - half, y1 = cy + half + 1;
-  const sum = integral[y1*stride+x1] - integral[y0*stride+x1] - integral[y1*stride+x0] + integral[y0*stride+x0];
-  const sumSq = integralSq[y1*stride+x1] - integralSq[y0*stride+x1] - integralSq[y1*stride+x0] + integralSq[y0*stride+x0];
-  const n = (x1 - x0) * (y1 - y0);
-  const mean = sum / n;
-  return sumSq / n - mean * mean;
+// Gradientes centrais (aprox. Sobel 1D) usados pro score de canto.
+function computeGradients(gray, w, h) {
+  const gx = new Float32Array(w * h), gy = new Float32Array(w * h);
+  for (let y = 1; y < h - 1; y++) {
+    const row = y * w;
+    for (let x = 1; x < w - 1; x++) {
+      const i = row + x;
+      gx[i] = gray[i + 1] - gray[i - 1];
+      gy[i] = gray[i + w] - gray[i - w];
+    }
+  }
+  return { gx, gy };
 }
 
-function patchSAD(prev, curr, w, h, px, py, dx, dy) {
+// Score de canto Shi-Tomasi: menor autovalor do tensor de estrutura local.
+// Alto nos dois eixos ao mesmo tempo = canto real (bom pra rastrear).
+// Alto só num eixo = borda (ambígua ao longo da própria direção).
+// Baixo nos dois = área lisa (parede sem textura, céu limpo).
+function cornerScoreAt(gx, gy, w, cx, cy, half) {
+  let sxx = 0, syy = 0, sxy = 0;
+  for (let yy = -half; yy <= half; yy++) {
+    const row = (cy + yy) * w;
+    for (let xx = -half; xx <= half; xx++) {
+      const i = row + cx + xx;
+      const ix = gx[i], iy = gy[i];
+      sxx += ix * ix; syy += iy * iy; sxy += ix * iy;
+    }
+  }
+  const trace = sxx + syy;
+  const det = sxx * syy - sxy * sxy;
+  const disc = Math.sqrt(Math.max(0, trace*trace/4 - det));
+  return trace / 2 - disc;
+}
+
+function patchMean(img, w, cx, cy, half) {
+  let sum = 0, n = 0;
+  for (let yy = -half; yy <= half; yy++) {
+    const row = (cy + yy) * w;
+    for (let xx = -half; xx <= half; xx++) { sum += img[row + cx + xx]; n++; }
+  }
+  return sum / n;
+}
+
+// SAD com média local subtraída dos dois patches (zero-mean SAD) — deixa
+// a comparação imune a diferenças de brilho/exposição entre os frames.
+function patchSAD(prev, curr, w, h, px, py, dx, dy, half, curMean) {
   const sx = px + dx, sy = py + dy;
-  if (sx - PATCH_HALF < 0 || sx + PATCH_HALF >= w || sy - PATCH_HALF < 0 || sy + PATCH_HALF >= h) return Infinity;
+  if (sx - half < 0 || sx + half >= w || sy - half < 0 || sy + half >= h ||
+      px - half < 0 || px + half >= w || py - half < 0 || py + half >= h) return Infinity;
+  const refMean = patchMean(prev, w, sx, sy, half);
   let sad = 0;
-  for (let yy = -PATCH_HALF; yy <= PATCH_HALF; yy++) {
+  for (let yy = -half; yy <= half; yy++) {
     const curRow = (py + yy) * w;
     const refRow = (sy + yy) * w;
-    for (let xx = -PATCH_HALF; xx <= PATCH_HALF; xx++) {
-      sad += Math.abs(curr[curRow + px + xx] - prev[refRow + sx + xx]);
+    for (let xx = -half; xx <= half; xx++) {
+      sad += Math.abs((curr[curRow + px + xx] - curMean) - (prev[refRow + sx + xx] - refMean));
     }
   }
   return sad;
@@ -622,15 +687,17 @@ function patchSAD(prev, curr, w, h, px, py, dx, dy) {
 const LDSP = [[-2,0],[2,0],[0,-2],[0,2],[-1,-1],[1,-1],[-1,1],[1,1]];
 const SDSP = [[-1,0],[1,0],[0,-1],[0,1]];
 const MAX_DIAMOND_STEPS = 6;
+const MAX_DIAMOND_STEPS_COARSE = 5;
 
-function diamondSearch(prev, curr, w, h, px, py, seedDx, seedDy) {
+function diamondSearch(prev, curr, w, h, px, py, seedDx, seedDy, half, maxSteps) {
+  const curMean = patchMean(curr, w, px, py, half);
   let cx = Math.round(seedDx), cy = Math.round(seedDy);
-  let bestSad = patchSAD(prev, curr, w, h, px, py, cx, cy);
-  for (let step = 0; step < MAX_DIAMOND_STEPS; step++) {
+  let bestSad = patchSAD(prev, curr, w, h, px, py, cx, cy, half, curMean);
+  for (let step = 0; step < maxSteps; step++) {
     let bestDx = cx, bestDy = cy, improved = false;
     for (const [ox, oy] of LDSP) {
       const dx = cx + ox, dy = cy + oy;
-      const sad = patchSAD(prev, curr, w, h, px, py, dx, dy);
+      const sad = patchSAD(prev, curr, w, h, px, py, dx, dy, half, curMean);
       if (sad < bestSad) { bestSad = sad; bestDx = dx; bestDy = dy; improved = true; }
     }
     cx = bestDx; cy = bestDy;
@@ -639,17 +706,63 @@ function diamondSearch(prev, curr, w, h, px, py, seedDx, seedDy) {
   let bestDx = cx, bestDy = cy;
   for (const [ox, oy] of SDSP) {
     const dx = cx + ox, dy = cy + oy;
-    const sad = patchSAD(prev, curr, w, h, px, py, dx, dy);
+    const sad = patchSAD(prev, curr, w, h, px, py, dx, dy, half, curMean);
     if (sad < bestSad) { bestSad = sad; bestDx = dx; bestDy = dy; }
   }
-  const patchSize = (PATCH_HALF * 2 + 1) * (PATCH_HALF * 2 + 1);
+  const patchSize = (half*2+1)*(half*2+1);
   return { dx: bestDx, dy: bestDy, avgSad: bestSad === Infinity ? Infinity : bestSad / patchSize };
+}
+
+// Busca em duas escalas: acha grosseiramente na imagem reduzida pela
+// metade (cobre um raio de deslocamento ~2x maior pro mesmo custo), depois
+// refina na resolução fina a partir dessa semente. É isso que permite
+// acompanhar giros rápidos sem perder o rastreamento.
+function pyramidDiamondSearch(px, py, seedDx, seedDy) {
+  const cpx = px >> 1, cpy = py >> 1;
+  const coarse = diamondSearch(
+    prevPyr.coarse, currPyrCoarse, COARSE_W, COARSE_H,
+    cpx, cpy, seedDx / 2, seedDy / 2, PATCH_HALF_COARSE, MAX_DIAMOND_STEPS_COARSE
+  );
+  const fineSeedDx = coarse.dx * 2, fineSeedDy = coarse.dy * 2;
+  return diamondSearch(
+    prevPyr.fine, currPyrFine, FINE_W, FINE_H,
+    px, py, fineSeedDx, fineSeedDy, PATCH_HALF, MAX_DIAMOND_STEPS
+  );
 }
 
 function median(arr) {
   const s = [...arr].sort((a,b)=>a-b);
   const mid = Math.floor(s.length/2);
   return s.length % 2 ? s[mid] : (s[mid-1]+s[mid])/2;
+}
+
+function weightedMedian(items) {
+  const sorted = [...items].sort((a,b) => a.value - b.value);
+  const totalWeight = sorted.reduce((s,i) => s + i.weight, 0);
+  let acc = 0;
+  for (const it of sorted) {
+    acc += it.weight;
+    if (acc >= totalWeight / 2) return it.value;
+  }
+  return sorted[sorted.length - 1].value;
+}
+
+// RANSAC 1D: sorteia um ponto como hipótese, conta quantos outros
+// concordam dentro da tolerância, e fica com a hipótese mais votada.
+// Muito mais robusto que mediana simples quando um grupo grande de pontos
+// se move junto por outro motivo (objeto em primeiro plano, sombra, etc.)
+// em vez de refletir só a rotação da câmera.
+function ransacInliers(results, tol, iterations) {
+  if (results.length === 0) return { inliers: [], hyp: 0 };
+  let bestHyp = results[0].dx, bestCount = -1;
+  for (let i = 0; i < iterations; i++) {
+    const hyp = results[(Math.random() * results.length) | 0].dx;
+    let count = 0;
+    for (const r of results) if (Math.abs(r.dx - hyp) <= tol) count++;
+    if (count > bestCount) { bestCount = count; bestHyp = hyp; }
+  }
+  const inliers = results.filter(r => Math.abs(r.dx - bestHyp) <= tol);
+  return { inliers, hyp: bestHyp };
 }
 
 let audioCtx = null;
@@ -668,30 +781,10 @@ function beep(freq, durationMs) {
   } catch (e) {}
 }
 
-function weightedMedian(items) {
-  const sorted = [...items].sort((a,b) => a.value - b.value);
-  const totalWeight = sorted.reduce((s,i) => s + i.weight, 0);
-  let acc = 0;
-  for (const it of sorted) {
-    acc += it.weight;
-    if (acc >= totalWeight / 2) return it.value;
-  }
-  return sorted[sorted.length - 1].value;
-}
-
 let yawVelocity = 0;
 let lastYawTickTime = performance.now();
 
 // ---- Correção de yaw da câmera aplicada DIRETO no quaternion do giroscópio ----
-// Antes, a câmera só escrevia num "yaw" escalar separado, usado apenas no
-// modo de contingência antiga (sem gyroQuaternion). Como o giroscópio agora
-// se auto-inicializa (ver handleMotion) e passa a ser o caminho principal
-// quase sempre, a câmera precisa corrigir esse MESMO quaternion — senão,
-// sem bússola, o giroscópio girando sozinho vai derivando devagar e nada
-// corrige. A correção usa o eixo local Z (mesma convenção do canal
-// rotationRate.alpha/gyroQuaternion) e tem o mesmo teto absoluto por tick
-// que já existia (MAX_CAMERA_YAW_STEP_RAD), então nunca pode causar um
-// salto/teleporte do cubo, exatamente como a correção fundida.
 const _cameraLocalYawAxis = new THREE.Vector3(0, 0, 1);
 const _cameraCorrectionQuat = new THREE.Quaternion();
 function feedCameraYawCorrection(deltaRad) {
@@ -702,13 +795,15 @@ function feedCameraYawCorrection(deltaRad) {
   gyroQuaternion.multiply(_cameraCorrectionQuat);
 }
 
-function selectActivePoints(ii) {
+// Seleciona pontos candidatos por score de canto (Shi-Tomasi), com
+// supressão de não-máximos por distância mínima entre pontos escolhidos.
+function selectActivePoints(gx, gy) {
   const scored = [];
   for (const cell of CANDIDATE_CELLS) {
-    const variance = boxVariance(ii, cell.x, cell.y, PATCH_HALF);
-    if (variance >= VARIANCE_FILTER_THRESHOLD) scored.push({ cell, variance });
+    const score = cornerScoreAt(gx, gy, FINE_W, cell.x, cell.y, PATCH_HALF);
+    if (score >= CORNER_SCORE_THRESHOLD) scored.push({ cell, score });
   }
-  scored.sort((a, b) => b.variance - a.variance);
+  scored.sort((a, b) => b.score - a.score);
 
   const active = [];
   const minSepSq = MIN_POINT_SEPARATION * MIN_POINT_SEPARATION;
@@ -732,51 +827,52 @@ function drawTrackDebug(activePoints, inlierIds) {
   }
 }
 
+let currPyrFine = null, currPyrCoarse = null;
+
 function opticalFlowTick() {
   if (!cameraActive) return;
   fineCtx.drawImage(videoEl, 0, 0, FINE_W, FINE_H);
-  const currFine = toGray(fineCtx, FINE_W, FINE_H);
+  currPyrFine = toGray(fineCtx, FINE_W, FINE_H);
+  currPyrCoarse = downsample2x(currPyrFine, FINE_W, FINE_H);
 
-  if (prevFine) {
-    const ii = buildIntegral(currFine, FINE_W, FINE_H);
-    const activePoints = selectActivePoints(ii);
+  if (prevPyr) {
+    const { gx, gy } = computeGradients(currPyrFine, FINE_W, FINE_H);
+    const activePoints = selectActivePoints(gx, gy);
 
     const results = [];
     for (const cell of activePoints) {
       const state = pointState.get(cell.id) || { health: 1.0, dx: predictedDx, dy: predictedDy };
-      const r = diamondSearch(prevFine, currFine, FINE_W, FINE_H, cell.x, cell.y, state.dx, state.dy);
+      const r = pyramidDiamondSearch(cell.x, cell.y, state.dx, state.dy);
       if (r.avgSad === Infinity) continue;
       results.push({ id: cell.id, x: cell.x, y: cell.y, dx: r.dx, dy: r.dy, health: state.health });
     }
 
     const nextPointState = new Map();
-    const inlierIds = new Set();
+    let inlierIds = new Set();
 
     if (results.length >= MIN_ACTIVE_POINTS) {
-      const roughMedDx = median(results.map(r => r.dx));
+      // Passada 1: RANSAC grosseiro pra descartar outliers óbvios.
+      const pass1 = ransacInliers(results, CONSENSUS_TOLERANCE_PX, RANSAC_ITERATIONS);
+      const refineBase = pass1.inliers.length >= MIN_ACTIVE_POINTS ? pass1.inliers : results;
+
+      // Passada 2: RANSAC mais rígido só entre quem sobreviveu à passada 1.
+      const pass2 = ransacInliers(refineBase, REFINE_CONSENSUS_TOLERANCE_PX, RANSAC_ITERATIONS);
+      const finalInliers = pass2.inliers.length >= Math.min(MIN_ACTIVE_POINTS, refineBase.length)
+        ? pass2.inliers : pass1.inliers;
+
+      inlierIds = new Set(finalInliers.map(r => r.id));
+
       for (const r of results) {
-        const wasInlier = Math.abs(r.dx - roughMedDx) <= CONSENSUS_TOLERANCE_PX;
-        if (wasInlier) inlierIds.add(r.id);
+        const wasInlier = inlierIds.has(r.id);
         const newHealth = THREE.MathUtils.clamp(r.health + (wasInlier ? 0.08 : -0.25), 0.05, 1.0);
         nextPointState.set(r.id, { health: newHealth, dx: r.dx, dy: r.dy });
       }
 
-      const inlierResults = results.filter(r => inlierIds.has(r.id));
-      const refineBase = inlierResults.length >= MIN_ACTIVE_POINTS ? inlierResults : results;
-      const refineMedDx = median(refineBase.map(r => r.dx));
-      const finalInlierIds = new Set();
-      for (const r of refineBase) {
-        if (Math.abs(r.dx - refineMedDx) <= REFINE_CONSENSUS_TOLERANCE_PX) finalInlierIds.add(r.id);
-      }
-      const useIds = finalInlierIds.size >= Math.min(MIN_ACTIVE_POINTS, refineBase.length) ? finalInlierIds : inlierIds;
-
-      const weightedItems = results.filter(r => useIds.has(r.id))
-        .map(r => ({ value: r.dx, weight: nextPointState.get(r.id).health }));
-      const weightedItemsY = results.filter(r => useIds.has(r.id))
-        .map(r => ({ value: r.dy, weight: nextPointState.get(r.id).health }));
-      const medDx = weightedItems.length ? weightedMedian(weightedItems) : roughMedDx;
+      const weightedItems = finalInliers.map(r => ({ value: r.dx, weight: nextPointState.get(r.id).health }));
+      const weightedItemsY = finalInliers.map(r => ({ value: r.dy, weight: nextPointState.get(r.id).health }));
+      const medDx = weightedItems.length ? weightedMedian(weightedItems) : median(results.map(r => r.dx));
       const medDy = weightedItemsY.length ? weightedMedian(weightedItemsY) : 0;
-      const consensus = useIds.size / results.length;
+      const consensus = finalInliers.length / results.length;
 
       predictedDx = medDx; predictedDy = medDy;
 
@@ -789,7 +885,7 @@ function opticalFlowTick() {
       dxHistory.push(medDx);
       if (dxHistory.length > 30) dxHistory.shift();
 
-      document.getElementById('stillState').textContent = `${useIds.size}/${results.length} pts`;
+      document.getElementById('stillState').textContent = `${finalInliers.length}/${results.length} pts`;
 
       const trust = consensus * (0.5 + 0.5*agreement);
       cameraTrust = trust;
@@ -798,11 +894,6 @@ function opticalFlowTick() {
       const dt = Math.max(0.02, (now - lastYawTickTime) / 1000);
       lastYawTickTime = now;
 
-      // A câmera só entra como corretora de yaw quando NÃO existe orientação
-      // absoluta fundida (bússola/Sensor API) alimentando o giroscópio —
-      // nesse caso ela é a única fonte capaz de conter a deriva do
-      // giroscópio puro. Quando a fusão absoluta existe, ela já cuida disso
-      // (feedFusedReading) e a câmera fica só de observadora/debug.
       if (!hasSensorQuaternion && trust > 0.15) {
         const deltaDeg = -medDx * DEG_PER_PIXEL_X;
         let deltaRad = THREE.MathUtils.degToRad(deltaDeg) * trust;
@@ -815,26 +906,11 @@ function opticalFlowTick() {
             deltaRad = Math.sign(deltaRad) * MAX_CAMERA_YAW_STEP_RAD;
           }
           if (isNoGyroDevice) {
-            // Sem giroscópio, o quaternion é recalculado do zero a cada
-            // leitura do acelerômetro (updateNoGyroOrientation) — corrigir o
-            // gyroQuaternion diretamente aqui seria inútil, pois a próxima
-            // leitura do acelerômetro (chega a ~60Hz) sobrescreveria a
-            // correção antes de qualquer frame renderizar. Por isso o yaw
-            // da câmera acumula num ângulo próprio, e é ESSE ângulo que
-            // entra na reconstrução do quaternion.
-            // Sinal invertido em relação ao deltaRad "cru": o eixo alpha
-            // usado por computeRawDeviceQuaternion gira no sentido oposto
-            // ao que a câmera mede (confirmado: cubo virava ao contrário).
             noGyroYawDeg -= THREE.MathUtils.radToDeg(deltaRad);
             updateNoGyroOrientation();
           } else if (hasGyroQuaternion) {
-            // Caminho principal: corrige o quaternion do giroscópio direto,
-            // no mesmo espaço "cru" em que ele integra — sem isso a câmera
-            // não tinha nenhum efeito quando o app já estava usando o
-            // giroscópio (só ajudava no modo de contingência por Euler).
             feedCameraYawCorrection(deltaRad);
           } else {
-            // Contingência extrema: nem devicemotion respondeu ainda.
             yaw += deltaRad;
             yawVelocity = yawVelocity * 0.5 + (deltaRad / dt) * 0.5;
           }
@@ -859,7 +935,7 @@ function opticalFlowTick() {
   } else {
     cameraTrust = 0;
   }
-  prevFine = currFine;
+  prevPyr = { fine: currPyrFine, coarse: currPyrCoarse };
 }
 
 async function startCamera() {
@@ -890,6 +966,26 @@ function showCameraError(err) {
   document.body.appendChild(box);
   document.getElementById('dismissCamErr').addEventListener('click', () => box.remove());
 }
+
+// ================= Inverter horizontal =================
+const invertYawBtn = document.getElementById('invertYawBtn');
+function refreshInvertYawBtn() {
+  invertYawBtn.style.background = invertYaw ? 'rgba(255,176,32,0.85)' : 'rgba(255,255,255,0.08)';
+  invertYawBtn.style.color = invertYaw ? '#071018' : '#fff';
+  invertYawBtn.textContent = invertYaw ? 'Inverter horiz. ✓' : 'Inverter horiz.';
+}
+refreshInvertYawBtn();
+invertYawBtn.addEventListener('click', () => {
+  invertYaw = !invertYaw;
+  try { localStorage.setItem('vrbox_invertYaw', invertYaw ? '1' : '0'); } catch (e) {}
+  refreshInvertYawBtn();
+  // Recalibra na hora pra não dar um salto visual quando o sinal do yaw muda.
+  if (hasGyroQuaternion) {
+    applyDisplayRemap(gyroQuaternion, _remappedGyro);
+    calibInverseQuaternion.copy(_remappedGyro).invert();
+  }
+  if (navigator.vibrate) navigator.vibrate(20);
+});
 
 // ================= Recentralizar =================
 document.getElementById('calibBtn').addEventListener('click', () => {
@@ -1024,8 +1120,6 @@ function animate() {
     document.getElementById('p').textContent = THREE.MathUtils.radToDeg(_hudEuler.x).toFixed(1);
     document.getElementById('r').textContent = THREE.MathUtils.radToDeg(_hudEuler.z).toFixed(1);
   } else {
-    // Contingência extrema: nem devicemotion respondeu ainda (sem
-    // acelerômetro/giroscópio nenhum). Só deve durar até o primeiro evento.
     if (hasCompassYaw && cameraTrust < 0.4 && yawCompassOffset !== null) {
       const compassEstimate = yawCompassRaw + yawCompassOffset;
       let diff = compassEstimate - yaw;
