@@ -136,12 +136,13 @@
     encaixe no visor.
   </p>
   <p style="font-size:11px; color:rgba(120,220,255,0.85)">
-    A rotação combina o giroscópio bruto (integrado a cada frame) com a
-    orientação absoluta fundida do celular como correção lenta de deriva —
-    filtro complementar clássico de IMU. A câmera reforça o yaw usando
-    rastreamento óptico multi-escala com detecção de cantos e consenso por
-    RANSAC, funcionando em qualquer cena (parede, céu, chão, o que a câmera
-    enxergar) desde que haja alguma textura.
+    A rotação usa o melhor sensor disponível no seu aparelho, em ordem de
+    preferência: giroscópio (integrado a cada frame, corrigido pela
+    orientação absoluta) → bússola + inclinação do sistema (sem giroscópio)
+    → inclinação do sistema + câmera (sem bússola) → acelerômetro cru +
+    câmera (última opção, quando nada mais está disponível). A câmera
+    sempre reforça o yaw com rastreamento óptico multi-escala e consenso
+    por RANSAC.
   </p>
   <p style="font-size:11px; color:rgba(255,176,32,0.85)">
     Pra andar: com o celular no VR box, ande de verdade segurando ele na
@@ -262,18 +263,6 @@ addEventListener('resize', resize);
 resize();
 
 // ================= Inversão de eixos (aplicada NA FONTE do sensor) =================
-// Em vez de decompor/recompor Euler DEPOIS de já ter fundido giroscópio +
-// orientação absoluta (o que gera resultados inconsistentes quando há roll
-// junto, e deixa a leitura do acelerômetro "desalinhada" do resto), a
-// inversão agora é aplicada diretamente nos valores crus de cada sensor,
-// antes de qualquer fusão:
-//   - giroscópio (rotationRate): nega a velocidade angular no eixo local
-//     correspondente (x = pitch, z = yaw)
-//   - orientação absoluta (alpha/beta/gamma): nega beta (pitch) e/ou alpha
-//     (yaw) antes de virar quaternion
-//   - acelerômetro (fallback sem giroscópio nenhum): nega o pitch bruto
-//     calculado por atan2
-// Assim os três caminhos ficam sempre de acordo entre si.
 let invertYaw = false;
 let invertPitch = false;
 try {
@@ -325,16 +314,25 @@ let lastSensorQuaternion = new THREE.Quaternion();
 let sensorAngularSpeed = 0; // rad/s — velocidade real de giro do aparelho
 let lastOrientationTickTime = performance.now();
 
-// ---- Aparelho sem giroscópio físico ----
+// ---- Capacidades do aparelho: o que está realmente disponível ----
+// gyroRotationRateSeen        -> giroscópio físico real (devicemotion.rotationRate)
+// hasFullOrientationEvents    -> alpha+beta+gamma (bússola/magnetômetro + inclinação do SO)
+// hasPartialOrientationEvents -> só beta+gamma (inclinação do SO, sem bússola)
+// isNoGyroDevice               -> nem giroscópio, nem bússola, nem inclinação do SO chegam;
+//                                  último recurso, reconstrói tudo via acelerômetro cru
 let gyroRotationRateSeen = false;
+let hasFullOrientationEvents = false;
+let hasPartialOrientationEvents = false;
 let isNoGyroDevice = false;
 let accelSampleCount = 0;
 const NO_GYRO_GRACE_SAMPLES = 8;
-let noGyroYawDeg = 0; // único DOF acumulado (só a câmera escreve aqui)
+let noGyroYawDeg = 0; // yaw acumulado só pela câmera, usado sempre que não há bússola disponível
 
 function updateNoGyroOrientation() {
-  // rawPitch/rawRoll já vêm com a inversão de pitch aplicada na fonte
-  // (dentro de handleMotion), então aqui é só converter pra quaternion.
+  // Último recurso: nem devicemotion.rotationRate nem deviceorientation
+  // chegam com nada usável — reconstrói a inclinação via atan2 do
+  // acelerômetro cru (rawPitch/rawRoll, já com a inversão aplicada na
+  // fonte dentro de handleMotion).
   computeRawDeviceQuaternion(
     noGyroYawDeg,
     THREE.MathUtils.radToDeg(rawPitch),
@@ -384,11 +382,6 @@ function handleMotion(e) {
       hasGyroQuaternion = true;
     }
 
-    // rotationRate.beta = velocidade angular no eixo X do aparelho (pitch)
-    // rotationRate.gamma = eixo Y (roll)
-    // rotationRate.alpha = eixo Z do aparelho (yaw/bússola)
-    // Invertemos aqui, na leitura crua, pra ficar consistente com todo o
-    // resto (orientação absoluta e acelerômetro).
     const pitchSign = invertPitch ? -1 : 1;
     const yawSign = invertYaw ? -1 : 1;
     const wx = THREE.MathUtils.degToRad((rr.beta || 0)) * pitchSign;
@@ -421,10 +414,6 @@ function handleMotion(e) {
 
   if (!gyroRotationRateSeen) accelSampleCount++;
 
-  // Detecção de passos reais (pedômetro) — é isso que move o jogador pela
-  // cena agora, em vez de toque na tela ou manche: cada passo físico dado
-  // com o celular no VR box empurra a posição pra frente, na direção pra
-  // onde a cabeça tá olhando naquele instante.
   detectStep(mag, nowMotion);
 
   if (accelFirst) { fx=g.x; fy=g.y; fz=g.z; accelFirst=false; }
@@ -433,23 +422,27 @@ function handleMotion(e) {
     fy += (g.y - fy) * ALPHA_LP;
     fz += (g.z - fz) * ALPHA_LP;
   }
-  // Pitch bruto do acelerômetro, já com a inversão aplicada na fonte —
-  // isso é o que fazia o acelerômetro "não seguir" o botão de inverter.
   const pitchSignAccel = invertPitch ? -1 : 1;
   rawPitch = pitchSignAccel * Math.atan2(-fx, Math.sqrt(fy*fy + fz*fz));
   rawRoll = Math.atan2(fy, fz);
   pitch = THREE.MathUtils.clamp(rawPitch - pitchOffset, -MAX_PITCH, MAX_PITCH);
   roll = THREE.MathUtils.clamp(rawRoll - rollOffset, -MAX_ROLL, MAX_ROLL);
 
-  if (!gyroRotationRateSeen && !isNoGyroDevice && accelSampleCount >= NO_GYRO_GRACE_SAMPLES) {
+  // Só cai no modo "acelerômetro cru" se realmente não houver NADA melhor
+  // chegando — nem giroscópio, nem bússola, nem sequer a inclinação básica
+  // que o sistema operacional calcula sozinho (que é sempre mais confiável
+  // que reconstruir via atan2, porque não assume portrait). Antes, esse
+  // modo entrava em ação sempre que faltava giroscópio, e então SOBRESCREVIA
+  // uma orientação absoluta boa a cada leitura do acelerômetro — essa era
+  // a causa das direções erradas em aparelhos sem giroscópio.
+  if (!gyroRotationRateSeen && !isNoGyroDevice && !hasFullOrientationEvents
+      && !hasPartialOrientationEvents && accelSampleCount >= NO_GYRO_GRACE_SAMPLES) {
     isNoGyroDevice = true;
   }
   if (isNoGyroDevice) {
     updateNoGyroOrientation();
     return;
   }
-
-  if (hasSensorQuaternion) return;
 }
 
 // ---- Yaw por bússola (fallback total, só se não houver gyroQuaternion) ----
@@ -463,6 +456,7 @@ const FUSED_SPEED_FOR_MIN_CORRECTION = THREE.MathUtils.degToRad(120);
 const FUSED_STALL_MS = 220;
 const TRUST_SOFT_DISAGREEMENT = THREE.MathUtils.degToRad(10);
 const MAX_CORRECTION_STEP_RAD = THREE.MathUtils.degToRad(4);
+const NO_GYRO_FUSED_SLERP = 0.65; // sem giroscópio real, adota a leitura do SO quase direto
 
 function feedFusedReading(rawQuat, now) {
   const dt = Math.max(0.004, (now - lastOrientationTickTime) / 1000);
@@ -473,6 +467,16 @@ function feedFusedReading(rawQuat, now) {
   if (!hasGyroQuaternion) {
     gyroQuaternion.copy(rawQuat);
     hasGyroQuaternion = true;
+    hasSensorQuaternion = true;
+    lastAcceptedFusedQuaternion.copy(rawQuat);
+    hasAcceptedFusedQuaternion = true;
+  } else if (!gyroRotationRateSeen) {
+    // Sem giroscópio físico não há nada integrando "entre" as leituras de
+    // orientação pra comparar/corrigir contra — a leitura do SO já é a
+    // melhor estimativa disponível. Adota quase direto (só um filtro leve
+    // pra tirar ruído), em vez do lerp bem lento pensado originalmente
+    // pra corrigir a deriva de um giroscópio que aqui não existe.
+    gyroQuaternion.slerp(rawQuat, NO_GYRO_FUSED_SLERP);
     hasSensorQuaternion = true;
     lastAcceptedFusedQuaternion.copy(rawQuat);
     hasAcceptedFusedQuaternion = true;
@@ -522,36 +526,44 @@ function feedFusedReading(rawQuat, now) {
 }
 
 function handleOrientation(e) {
-  if (typeof e.alpha === 'number' && typeof e.beta === 'number' && typeof e.gamma === 'number') {
-    // Inversão aplicada aqui, na leitura bruta de alpha/beta, antes de
-    // qualquer composição de quaternion — mesma convenção usada no
-    // giroscópio e no acelerômetro, então os três caminhos concordam.
+  if (typeof e.beta !== 'number' || typeof e.gamma !== 'number') return;
+
+  const betaAdj = invertPitch ? -e.beta : e.beta;
+  const gammaVal = e.gamma;
+
+  if (typeof e.alpha === 'number') {
+    // Bússola/magnetômetro disponível: alpha+beta+gamma dão a orientação
+    // absoluta completa, igual antes.
+    hasFullOrientationEvents = true;
     const alphaAdj = invertYaw ? -e.alpha : e.alpha;
-    const betaAdj = invertPitch ? -e.beta : e.beta;
     if (fusionSourceLabel === 'sensor-api-nativa') {
-      computeRawDeviceQuaternion(alphaAdj, betaAdj, e.gamma, sensorQuaternion);
+      computeRawDeviceQuaternion(alphaAdj, betaAdj, gammaVal, sensorQuaternion);
     } else {
-      computeRawDeviceQuaternion(alphaAdj, betaAdj, e.gamma, _rawFusedQuaternion);
+      computeRawDeviceQuaternion(alphaAdj, betaAdj, gammaVal, _rawFusedQuaternion);
       sensorQuaternion.copy(_rawFusedQuaternion);
       feedFusedReading(_rawFusedQuaternion, performance.now());
     }
-  }
 
-  if (typeof e.alpha === 'number') {
-    const alphaAdj = invertYaw ? -e.alpha : e.alpha;
     yawCompassRaw = THREE.MathUtils.degToRad(360 - alphaAdj);
     hasCompassYaw = true;
     if (yawCompassOffset === null) yawCompassOffset = yaw - yawCompassRaw;
+  } else {
+    // Sem bússola/magnetômetro (comum em aparelhos sem giroscópio): mesmo
+    // assim, beta/gamma do sistema operacional são MUITO mais confiáveis
+    // que reconstruir a inclinação via atan2 do acelerômetro cru — aquela
+    // fórmula assume o aparelho em pé (portrait) e embaralha pitch/roll
+    // quando ele está deitado de lado dentro da caixa de VR, que é
+    // exatamente o motivo das direções erradas. O yaw fica por conta da
+    // câmera (ver opticalFlowTick, que escreve em noGyroYawDeg).
+    hasPartialOrientationEvents = true;
+    computeRawDeviceQuaternion(noGyroYawDeg, betaAdj, gammaVal, _rawFusedQuaternion);
+    gyroQuaternion.copy(_rawFusedQuaternion);
+    hasGyroQuaternion = true;
+    hasSensorQuaternion = false; // libera a câmera pra comandar o yaw
   }
 }
 
 // ================= Sensor API nativa (AbsoluteOrientationSensor) =================
-// Observação: essa API entrega o quaternion já fundido pelo sistema
-// operacional, então não dá pra "adiantar" a inversão em alpha/beta/gamma
-// crus como fazemos acima — aqui aplicamos a inversão decompondo o
-// quaternion recebido em Euler (YXZ), invertendo x/y e recompondo, ANTES de
-// entrar na fusão com o giroscópio. Isso mantém os três caminhos (nativo,
-// alpha/beta/gamma, giroscópio) consistentes entre si.
 let nativeSensor = null;
 const _nativeRawQuat = new THREE.Quaternion();
 const _nativeEuler = new THREE.Euler();
@@ -576,6 +588,7 @@ async function tryStartNativeSensor() {
         if (invertPitch) _nativeEuler.x = -_nativeEuler.x;
         _nativeRawQuat.setFromEuler(_nativeEuler);
       }
+      hasFullOrientationEvents = true;
       sensorQuaternion.copy(_nativeRawQuat);
       feedFusedReading(_nativeRawQuat, performance.now());
     });
@@ -947,12 +960,6 @@ function opticalFlowTick() {
       const dt = Math.max(0.02, (now - lastYawTickTime) / 1000);
       lastYawTickTime = now;
 
-      // O yaw medido pela câmera é um deslocamento físico observado — não
-      // depende da convenção de sinal do sensor do aparelho. Mas se o
-      // usuário pediu pra inverter o horizontal, o "pra onde ele quer
-      // olhar" também deve inverter aqui, senão câmera e giroscópio passam
-      // a brigar entre si (um dizendo pra virar de um jeito, outro do
-      // oposto), que é exatamente a inconsistência relatada.
       const yawSignCam = invertYaw ? -1 : 1;
 
       if (!hasSensorQuaternion && trust > 0.15) {
@@ -966,9 +973,16 @@ function opticalFlowTick() {
           if (Math.abs(deltaRad) > MAX_CAMERA_YAW_STEP_RAD) {
             deltaRad = Math.sign(deltaRad) * MAX_CAMERA_YAW_STEP_RAD;
           }
-          if (isNoGyroDevice) {
+          // Sem bússola (com OU sem giroscópio) a câmera é a única fonte de
+          // yaw absoluto-ish disponível, então tem que ACUMULAR de forma
+          // persistente em noGyroYawDeg — do contrário, a próxima leitura
+          // de orientação/acelerômetro reconstrói o quaternion do zero e
+          // apaga a correção que acabou de ser aplicada (esse era o bug
+          // que fazia o giro "não pegar" direito nesses aparelhos).
+          const yawHasNoCompass = isNoGyroDevice || (hasPartialOrientationEvents && !hasFullOrientationEvents);
+          if (yawHasNoCompass) {
             noGyroYawDeg -= THREE.MathUtils.radToDeg(deltaRad);
-            updateNoGyroOrientation();
+            if (isNoGyroDevice) updateNoGyroOrientation();
           } else if (hasGyroQuaternion) {
             feedCameraYawCorrection(deltaRad);
           } else {
@@ -1029,13 +1043,6 @@ function showCameraError(err) {
 }
 
 // ================= Recalibração ao trocar inversão =================
-// Como a inversão agora muda o SIGNIFICADO dos dados brutos (e não só uma
-// pintura por cima do resultado final), o estado acumulado do giroscópio
-// fica "torto" no instante da troca. Em vez de tentar remapear esse estado
-// na hora (o que ainda causa um salto visual, só que de forma mais sutil e
-// difícil de prever), é mais confiável forçar uma reinicialização completa:
-// a fusão recomeça do zero na próxima leitura de sensor (que chega em
-// menos de 1/60s), como se tivesse acabado de tocar "Recentralizar".
 function resetOrientationState() {
   hasGyroQuaternion = false;
   hasSensorQuaternion = false;
@@ -1043,6 +1050,8 @@ function resetOrientationState() {
   glitchRejectStreak = 0;
   isNoGyroDevice = false;
   gyroRotationRateSeen = false;
+  hasFullOrientationEvents = false;
+  hasPartialOrientationEvents = false;
   accelSampleCount = 0;
   noGyroYawDeg = 0;
   yaw = 0; pitch = 0; roll = 0;
@@ -1110,38 +1119,20 @@ document.addEventListener('visibilitychange', () => {
 // ======================================================================
 // ================= Andar pelo espaço (locomoção) =================
 // ======================================================================
-// Posição livre no plano XZ, altura fixa (sem pular/agachar por enquanto).
-// Duas formas de andar:
-//  1. Fora do modo VR / modo preview: manche (joystick) no canto — arrasta
-//     numa direção e anda relativo à tela (não relativo ao olhar), útil
-//     pra testar no notebook/celular na mão.
-//  2. Dentro do modo VR (celular no visor, sem acesso à tela): toca e
-//     segura em QUALQUER lugar da tela = andar pra frente na direção que
-//     a cabeça tá olhando (yaw), soltando o toque = parar. É o mesmo
-//     esquema usado por a maioria das caixas de papelão com "gatilho"
-//     (um botão/alavanca que encosta na tela).
 const posState = { x: 0, z: 0 };
-const WORLD_HALF_SIZE = 26; // limite do "chão" pra não andar até o infinito
+const WORLD_HALF_SIZE = 26;
 
-let currentYaw = 0; // yaw "de exibição" mais recente, usado pra saber a direção do passo
+let currentYaw = 0;
 
-// ---- Detecção de passos reais (pedômetro via acelerômetro) ----
-// Ideia clássica de pedômetro de celular: a magnitude do vetor de
-// aceleração (incluindo gravidade) oscila pra cima e pra baixo a cada
-// passada, por causa do impacto do pé no chão. Em vez de tentar integrar
-// aceleração pra virar posição (isso diverge muito rápido, some em
-// segundos), a gente só CONTA os picos dessa oscilação e avança uma
-// "passada" de tamanho fixo a cada pico detectado — é o mesmo princípio
-// usado nos apps de contador de passos do celular.
 const GRAVITY_MAG = 9.81;
-let stepBaseline = GRAVITY_MAG;      // média móvel lenta = "nível de repouso"
-const STEP_BASELINE_ALPHA = 0.03;    // quão rápido o baseline persegue a média
-const STEP_PEAK_THRESHOLD = 1.35;    // m/s² acima do baseline pra considerar "subida de passo"
-const STEP_RESET_THRESHOLD = 0.4;    // precisa cair até aqui pra rearmar a detecção do próximo passo
-const STEP_MIN_INTERVAL_MS = 260;    // ~3.8 passos/s no máximo (evita contar tremedeira como passo)
-let stepArmed = true;                // true = pronto pra detectar o próximo pico
+let stepBaseline = GRAVITY_MAG;
+const STEP_BASELINE_ALPHA = 0.03;
+const STEP_PEAK_THRESHOLD = 1.35;
+const STEP_RESET_THRESHOLD = 0.4;
+const STEP_MIN_INTERVAL_MS = 260;
+let stepArmed = true;
 let lastStepTime = 0;
-const STRIDE_LENGTH = 0.62;          // metros avançados por passo detectado
+const STRIDE_LENGTH = 0.62;
 let stepCount = 0;
 
 function detectStep(mag, nowMs) {
@@ -1153,14 +1144,12 @@ function detectStep(mag, nowMs) {
     lastStepTime = nowMs;
     onStepDetected();
   } else if (!stepArmed && dev < STEP_RESET_THRESHOLD) {
-    stepArmed = true; // oscilação voltou perto do repouso, pronto pra próxima passada
+    stepArmed = true;
   }
 }
 
 function onStepDetected() {
   stepCount++;
-  // Direção "pra frente" da cabeça no plano XZ (ignora pitch/roll — senão
-  // olhar pro chão faria o passo contar como "andando pra baixo").
   const sinY = Math.sin(currentYaw), cosY = Math.cos(currentYaw);
   const forwardX = -sinY, forwardZ = -cosY;
   posState.x += forwardX * STRIDE_LENGTH;
@@ -1171,14 +1160,13 @@ function onStepDetected() {
   if (navigator.vibrate) navigator.vibrate(12);
 }
 
-// ---- Manche (fora do VR, só pra testar sem andar de verdade) ----
 const joystickEl = document.getElementById('joystick');
 const joystickStickEl = document.getElementById('joystickStick');
 let joystickActive = false;
-let joystickVecX = 0, joystickVecY = 0; // -1..1
+let joystickVecX = 0, joystickVecY = 0;
 let joystickPointerId = null;
 const JOYSTICK_RADIUS = 55;
-const JOYSTICK_SPEED = 1.7; // m/s, só usado pelo manche manual
+const JOYSTICK_SPEED = 1.7;
 
 function joystickReset() {
   joystickActive = false;
@@ -1210,9 +1198,6 @@ function updateJoystick(e) {
 }
 
 function updateLocomotion(dt) {
-  // O manche e o teclado só existem pra testar fora do VR box (sem
-  // celular no visor, sem andar de verdade). Dentro do VR, quem move o
-  // jogador são os passos reais detectados em detectStep()/onStepDetected().
   let fwd = 0, strafe = 0;
   if (joystickActive) {
     fwd += -joystickVecY;
@@ -1346,7 +1331,11 @@ function animate() {
     const glitchTag = glitchRejectStreak > 0 ? ` · ignorando leitura ruim (${glitchRejectStreak})` : '';
     let sourceLabel;
     if (isNoGyroDevice) {
-      sourceLabel = 'acelerômetro (pitch/roll) + câmera (yaw) · sem giroscópio';
+      sourceLabel = 'acelerômetro (pitch/roll) + câmera (yaw) · sem giroscópio nem bússola';
+    } else if (!gyroRotationRateSeen && hasPartialOrientationEvents) {
+      sourceLabel = 'inclinação do SO (pitch/roll) + câmera (yaw) · sem giroscópio nem bússola';
+    } else if (!gyroRotationRateSeen && hasFullOrientationEvents) {
+      sourceLabel = `bússola + inclinação do SO (sem giroscópio) · ${fusionSourceLabel}`;
     } else if (hasSensorQuaternion) {
       sourceLabel = `giroscópio + ${fusionSourceLabel}`;
     } else {
@@ -1388,7 +1377,7 @@ function animate() {
 
   updateLocomotion(dtFrame);
   neckPivot.position.set(posState.x, 0, posState.z);
-  skyMesh.position.set(posState.x, 0, posState.z); // céu sempre centrado no jogador
+  skyMesh.position.set(posState.x, 0, posState.z);
   document.getElementById('posXY').textContent = `${posState.x.toFixed(1)}, ${posState.z.toFixed(1)}`;
 
   const speedDeg = Math.abs(THREE.MathUtils.radToDeg(displaySpeedRad));
@@ -1414,3 +1403,4 @@ animate();
 </script>
 </body>
 </html>
+
