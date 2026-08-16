@@ -78,7 +78,7 @@
 
 <div id="vignette"></div>
 <div id="hud">
-  yaw: <span id="y">0.0</span>° · pitch: <span id="p">0.0</span>°<br>
+  yaw: <span id="y">0.0</span>° · pitch: <span id="p">0.0</span>° · roll: <span id="r">0.0</span>°<br>
   <span id="modeY">-</span> · <span id="stillState">-</span>
 </div>
 <div id="reticle"></div>
@@ -99,12 +99,13 @@
   <h2>VR Box — Cubo</h2>
   <p>
     Deite o celular na horizontal, ative os sensores, entre em tela cheia e
-    encaixe no visor. Yaw vem da fusão câmera+acelerômetro; pitch vem do
-    sensor de inclinação.
+    encaixe no visor. Yaw vem da fusão câmera+bússola; pitch e roll vêm do
+    sensor de inclinação, com resposta imediata nos 3 eixos.
   </p>
   <p style="font-size:11px; color:rgba(255,180,32,0.85)">
     Atenção: se o VR box tampar a câmera traseira, o rastreio de yaw por
-    câmera não funciona — só a inclinação (pitch) continua ativa.
+    câmera não funciona — o giro pros lados passa a usar só a bússola do
+    celular, que é menos precisa.
   </p>
   <div>
     <button id="startBtn">Ativar sensores</button>
@@ -117,21 +118,17 @@
 // ================= Cena =================
 const scene = new THREE.Scene();
 
-// "Pescoço" — pivô que gira (yaw + pitch). Os olhos ficam deslocados dele
-// (acima e um pouco à frente), então olhar pra cima/baixo produz um leve
-// arco de paralaxe natural em vez de rotação pura no mesmo ponto — é o
-// "neck model" usado pelo Google Cardboard SDK e apps de VR Theater.
 const neckPivot = new THREE.Object3D();
 scene.add(neckPivot);
 
-const NECK_HEIGHT = 0.18;  // olhos acima do pivô do pescoço
-const NECK_FORWARD = 0.10; // olhos um pouco à frente do pivô
+const NECK_HEIGHT = 0.18;
+const NECK_FORWARD = 0.10;
 
 const head = new THREE.Object3D();
 head.position.set(0, NECK_HEIGHT, -NECK_FORWARD);
 neckPivot.add(head);
 
-const IPD = 0.32; // distância entre os "olhos" em unidades de cena (exagerada pra separação notável)
+const IPD = 0.32;
 const eyeL = new THREE.PerspectiveCamera(70, 1, 0.05, 100);
 const eyeR = new THREE.PerspectiveCamera(70, 1, 0.05, 100);
 eyeL.position.set(-IPD/2, 0, 0);
@@ -143,7 +140,6 @@ const keyLight = new THREE.DirectionalLight(0xffffff, 0.9);
 keyLight.position.set(3, 5, 4);
 scene.add(keyLight);
 
-// Fundo em gradiente (esfera invertida) pra sensação de ambiente, não vazio
 const skyGeo = new THREE.SphereGeometry(50, 24, 24);
 const skyMat = new THREE.ShaderMaterial({
   side: THREE.BackSide,
@@ -179,7 +175,7 @@ const faceDefs = [
 const materials = faceDefs.map(f => new THREE.MeshStandardMaterial({ map: makeFaceTexture(f.l, f.c) }));
 const geometry = new THREE.BoxGeometry(1.2, 1.2, 1.2);
 const cube = new THREE.Mesh(geometry, materials);
-cube.position.set(0, 0, -3); // cubo fixo à frente da cabeça
+cube.position.set(0, 0, -3);
 scene.add(cube);
 const edges = new THREE.EdgesGeometry(geometry);
 const cubeEdges = new THREE.LineSegments(edges, new THREE.LineBasicMaterial({ color: 0x000000 }));
@@ -205,12 +201,13 @@ function resize() {
 addEventListener('resize', resize);
 resize();
 
-// ================= Estado de rotação (yaw/pitch da cabeça) =================
-let pitch = 0, yaw = 0;
-let pitchOffset = 0;
-let rawPitch = 0;
+// ================= Estado de rotação (yaw/pitch/roll da cabeça) =================
+let pitch = 0, yaw = 0, roll = 0;
+let pitchOffset = 0, rollOffset = 0;
+let rawPitch = 0, rawRoll = 0;
 let prevRawPitchAtTick = 0;
-const MAX_PITCH = THREE.MathUtils.degToRad(85); // evita virar de cabeça pra baixo (gimbal lock)
+const MAX_PITCH = THREE.MathUtils.degToRad(85);
+const MAX_ROLL = THREE.MathUtils.degToRad(80);
 
 // ================= Acelerômetro: pitch + detecção de "parado" =================
 let fx = 0, fy = 0, fz = 0, accelFirst = true;
@@ -245,29 +242,33 @@ function handleMotion(e) {
     fy += (g.y - fy) * ALPHA_LP;
     fz += (g.z - fz) * ALPHA_LP;
   }
-  // Em modo paisagem (landscape), o eixo que sobe/desce visualmente muda —
-  // por isso usamos fx (não fy) como referência de "cima/baixo" aqui.
   rawPitch = Math.atan2(-fx, Math.sqrt(fy*fy + fz*fz));
   pitch = THREE.MathUtils.clamp(rawPitch - pitchOffset, -MAX_PITCH, MAX_PITCH);
 }
 
+// ---- Yaw por bússola (fallback contínuo, sempre calculado) ----
+let yawCompassOffset = null;   // calibra a bússola pro yaw interno na 1a leitura / recentralização
+let yawCompassRaw = 0;         // último valor bruto da bússola (0-2π)
+let hasCompassYaw = false;
+
 function handleOrientation(e) {
   if (typeof e.beta === 'number' && typeof e.gamma === 'number') {
     orientationGaveRealBeta = true;
-    // Em paisagem, gamma tende a representar a inclinação frente/trás; ajuste simples:
     rawPitch = THREE.MathUtils.degToRad(e.gamma);
     pitch = THREE.MathUtils.clamp(rawPitch - pitchOffset, -MAX_PITCH, MAX_PITCH);
+    // beta ficava sem uso — em paisagem ele carrega a inclinação lateral
+    // (cabeça pendendo pro ombro), então vira o eixo de roll.
+    rawRoll = THREE.MathUtils.degToRad(e.beta);
+    roll = THREE.MathUtils.clamp(rawRoll - rollOffset, -MAX_ROLL, MAX_ROLL);
   }
-  if (typeof e.alpha === 'number' && !cameraActive) {
-    yaw = THREE.MathUtils.degToRad(360 - e.alpha);
-    document.getElementById('modeY').textContent = 'bússola';
+  if (typeof e.alpha === 'number') {
+    yawCompassRaw = THREE.MathUtils.degToRad(360 - e.alpha);
+    hasCompassYaw = true;
+    if (yawCompassOffset === null) yawCompassOffset = yaw - yawCompassRaw;
   }
 }
 
 // ================= Câmera: rastreio multi-ponto -> yaw =================
-// Em vez de comparar o frame inteiro (frágil contra objetos que se mexem na
-// cena ou reflexos localizados), rastreamos vários pontos independentes e
-// combinamos por consenso — descartando os que discordam da maioria.
 const FINE_W = 48, FINE_H = 36;
 const FOV_H_DEG = 60;
 const FOV_V_DEG = FOV_H_DEG * (FINE_H / FINE_W);
@@ -275,29 +276,30 @@ const DEG_PER_PIXEL_X = FOV_H_DEG / FINE_W;
 const DEG_PER_PIXEL_Y = FOV_V_DEG / FINE_H;
 const AGREEMENT_TOLERANCE_PX = 3.5;
 
-const PATCH_HALF = 3;        // patch de 7x7 por ponto
-const TEXTURE_MIN_VARIANCE = 60; // abaixo disso, patch "liso demais" -> descarta
+const PATCH_HALF = 3;
+const TEXTURE_MIN_VARIANCE = 60;
 const CONSENSUS_TOLERANCE_PX = 1.6;
 
-// ---- Camada grossa: poucos pontos, busca ampla -> pega giros rápidos ----
+// Ranges de busca reduzidos: o `predictedDx/Dy` (vindo do frame anterior)
+// já centraliza a busca perto de onde o ponto deve estar, então uma janela
+// menor mantém a precisão com bem menos comparações por frame.
 const COARSE_LAYER = [
-  {x:8,y:7, range:9}, {x:40,y:7, range:9},
-  {x:8,y:29, range:9}, {x:40,y:29, range:9},
+  {x:8,y:7, range:6}, {x:40,y:7, range:6},
+  {x:8,y:29, range:6}, {x:40,y:29, range:6},
 ];
-// ---- Camada fina: grade densa, busca pequena -> precisão no dia a dia ----
 const FINE_LAYER = [
   {x:10,y:9},{x:19,y:9},{x:29,y:9},{x:38,y:9},
   {x:10,y:18},{x:19,y:18},{x:29,y:18},{x:38,y:18},
   {x:10,y:27},{x:19,y:27},{x:29,y:27},{x:38,y:27},
-].map(p => ({ ...p, range: 5 }));
+].map(p => ({ ...p, range: 3 }));
 
 const ALL_POINTS = [...COARSE_LAYER, ...FINE_LAYER];
-// Saúde por ponto (0-1): sobe quando o ponto concorda com o consenso, cai
-// quando discorda ou fica sem textura — pontos "problemáticos" perdem peso
-// gradualmente em vez de continuar contando igual aos bons.
 const pointHealth = ALL_POINTS.map(() => 1.0);
 
 let cameraActive = false;
+let opticalFlowLoopActive = false;
+let lastOpticalFlowTickTime = 0;
+const OPTICAL_FLOW_MIN_INTERVAL_MS = 70; // ~14 Hz é suficiente e bem mais barato que 60fps
 const videoEl = document.getElementById('camPreview');
 
 const fineCanvas = document.createElement('canvas');
@@ -305,9 +307,12 @@ fineCanvas.width = FINE_W; fineCanvas.height = FINE_H;
 const fineCtx = fineCanvas.getContext('2d', { willReadFrequently: true });
 let prevFine = null;
 
-// Previsão de onde os pontos devem estar (baseado no resultado do frame
-// anterior) — reduz a busca necessária e ajuda a acompanhar giros rápidos.
 let predictedDx = 0, predictedDy = 0;
+let dxHistory = [];
+
+// Confiança da última leitura da câmera (0 = nada confiável -> usa bússola;
+// 1 = totalmente confiável -> usa câmera). Lido pelo loop de animação.
+let cameraTrust = 0;
 
 function toGray(ctx, w, h) {
   const data = ctx.getImageData(0, 0, w, h).data;
@@ -357,7 +362,6 @@ function median(arr) {
   return s.length % 2 ? s[mid] : (s[mid-1]+s[mid])/2;
 }
 
-// ---- Áudio: bipe curto quando o rastreio cai (útil dentro da caixa, sem ver o HUD) ----
 let audioCtx = null;
 let lastBeepTime = 0;
 let wasTrackingGood = true;
@@ -374,7 +378,7 @@ function beep(freq, durationMs) {
   } catch (e) {}
 }
 
-function weightedMedian(items) { // items: [{value, weight}]
+function weightedMedian(items) {
   const sorted = [...items].sort((a,b) => a.value - b.value);
   const totalWeight = sorted.reduce((s,i) => s + i.weight, 0);
   let acc = 0;
@@ -385,7 +389,7 @@ function weightedMedian(items) { // items: [{value, weight}]
   return sorted[sorted.length - 1].value;
 }
 
-let yawVelocity = 0; // rad/s — usado pra extrapolar movimento suave entre leituras da câmera
+let yawVelocity = 0;
 let lastYawTickTime = performance.now();
 
 function opticalFlowTick() {
@@ -394,11 +398,11 @@ function opticalFlowTick() {
   const currFine = toGray(fineCtx, FINE_W, FINE_H);
 
   if (prevFine) {
-    const results = []; // { idx, dx, dy, health }
+    const results = [];
     for (let i = 0; i < ALL_POINTS.length; i++) {
       const pt = ALL_POINTS[i];
       if (patchVariance(prevFine, FINE_W, pt.x, pt.y) < TEXTURE_MIN_VARIANCE) {
-        pointHealth[i] = Math.max(0, pointHealth[i] - 0.15); // sem textura -> perde saúde
+        pointHealth[i] = Math.max(0, pointHealth[i] - 0.15);
         continue;
       }
       const r = trackPoint(prevFine, currFine, FINE_W, FINE_H, pt.x, pt.y,
@@ -407,11 +411,9 @@ function opticalFlowTick() {
     }
 
     if (results.length >= 4) {
-      // Mediana simples primeiro, só pra achar o consenso inicial
       const roughMedDx = median(results.map(r => r.dx));
       const inliers = results.filter(r => Math.abs(r.dx - roughMedDx) <= CONSENSUS_TOLERANCE_PX);
 
-      // Atualiza a saúde de cada ponto: sobe se foi inlier, cai se foi outlier
       for (const r of results) {
         const wasInlier = Math.abs(r.dx - roughMedDx) <= CONSENSUS_TOLERANCE_PX;
         pointHealth[r.idx] = THREE.MathUtils.clamp(
@@ -419,7 +421,6 @@ function opticalFlowTick() {
         );
       }
 
-      // Mediana ponderada pela saúde -> pontos historicamente ruins pesam menos
       const weightedItems = results.map(r => ({ value: r.dx, weight: pointHealth[r.idx] }));
       const weightedItemsY = results.map(r => ({ value: r.dy, weight: pointHealth[r.idx] }));
       const medDx = weightedMedian(weightedItems);
@@ -440,6 +441,7 @@ function opticalFlowTick() {
       stillEl.textContent = `${inliers.length}/${results.length} pts`;
 
       const trust = consensus * (0.5 + 0.5*agreement);
+      cameraTrust = trust;
 
       const now = performance.now();
       const dt = Math.max(0.02, (now - lastYawTickTime) / 1000);
@@ -461,6 +463,8 @@ function opticalFlowTick() {
       }
       wasTrackingGood = trackingGoodNow;
     }
+  } else {
+    cameraTrust = 0;
   }
   prevFine = currFine;
 }
@@ -473,9 +477,14 @@ async function startCamera() {
     videoEl.srcObject = stream;
     await videoEl.play();
     cameraActive = true;
-    setInterval(opticalFlowTick, 80);
+    // Antes: setInterval fixo de 80ms, que roda mesmo com a aba oculta e não
+    // se alinha ao ciclo de renderização (gera "engasgos"). Agora o tick é
+    // agendado dentro do próprio requestAnimationFrame do render loop,
+    // pausando sozinho quando a aba está em background — menos CPU/bateria
+    // e leituras mais consistentes com o que está sendo desenhado.
+    opticalFlowLoopActive = true;
   } catch (err) {
-    document.getElementById('modeY').textContent = 'câmera indisponível';
+    document.getElementById('modeY').textContent = 'câmera indisponível (bússola)';
     showCameraError(err);
   }
 }
@@ -490,7 +499,7 @@ function showCameraError(err) {
     + 'Toque no ícone de cadeado ao lado do endereço → Permissões → Câmera → Permitir.<br>'
     + 'Depois feche esta aba e abra de novo.<br>'
     + '<span style="opacity:0.6;font-size:11px;margin-top:8px;display:block">erro técnico: ' + (err.message || err.name || err) + '</span>'
-    + '<button id="dismissCamErr" style="margin-top:16px;padding:10px 20px;border-radius:8px;border:none;background:#ffb020;color:#071018;font-weight:700">Continuar sem câmera (só cima/baixo)</button>';
+    + '<button id="dismissCamErr" style="margin-top:16px;padding:10px 20px;border-radius:8px;border:none;background:#ffb020;color:#071018;font-weight:700">Continuar sem câmera (só bússola)</button>';
   document.body.appendChild(box);
   document.getElementById('dismissCamErr').addEventListener('click', () => box.remove());
 }
@@ -498,8 +507,11 @@ function showCameraError(err) {
 // ================= Recentralizar =================
 document.getElementById('calibBtn').addEventListener('click', () => {
   yaw = 0;
+  yawCompassOffset = null; // recalibra a referência da bússola na próxima leitura
   pitchOffset = rawPitch;
   pitch = 0;
+  rollOffset = rawRoll;
+  roll = 0;
   if (navigator.vibrate) navigator.vibrate(30);
 });
 
@@ -570,7 +582,7 @@ document.getElementById('startBtn').addEventListener('click', async () => {
 });
 
 document.getElementById('vrBtn').addEventListener('click', async () => {
-  await startSensors(); // garante que os sensores estejam ativos mesmo se pulou o outro botão
+  await startSensors();
   await enterVrMode();
 });
 
@@ -578,20 +590,45 @@ document.getElementById('vrBtn').addEventListener('click', async () => {
 function animate() {
   requestAnimationFrame(animate);
 
+  if (opticalFlowLoopActive) {
+    const nowFlow = performance.now();
+    if (nowFlow - lastOpticalFlowTickTime >= OPTICAL_FLOW_MIN_INTERVAL_MS) {
+      lastOpticalFlowTickTime = nowFlow;
+      opticalFlowTick();
+    }
+  }
+
+  // Fusão câmera + bússola pro yaw: quando a câmera está confiável, ela já
+  // escreveu direto em `yaw` (mais responsiva/precisa). Quando não está
+  // (sem textura, câmera tampada, emulador sem vídeo real), puxamos `yaw`
+  // suavemente pra estimativa da bússola em vez de deixá-lo travado.
+  if (hasCompassYaw && cameraTrust < 0.4 && yawCompassOffset !== null) {
+    const compassEstimate = yawCompassRaw + yawCompassOffset;
+    let diff = compassEstimate - yaw;
+    diff = Math.atan2(Math.sin(diff), Math.cos(diff)); // menor caminho angular
+    const pullStrength = THREE.MathUtils.lerp(0.06, 0.20, 1 - cameraTrust);
+    yaw += diff * pullStrength;
+    if (cameraTrust < 0.05) {
+      document.getElementById('modeY').textContent = 'bússola';
+    }
+  }
+
   const dtFrame = Math.min(0.05, (performance.now() - lastYawTickTime) / 1000);
   const yawExtrapolated = yaw + yawVelocity * dtFrame * 0.4;
 
-  neckPivot.rotation.y += (yawExtrapolated - neckPivot.rotation.y) * 0.35;
-  neckPivot.rotation.x += (pitch - neckPivot.rotation.x) * 0.2;
+  // Suavização mais leve = resposta quase instantânea nos 3 eixos (antes
+  // só o yaw tinha extrapolação; pitch/roll ficavam com um "atraso" perceptível).
+  neckPivot.rotation.y += (yawExtrapolated - neckPivot.rotation.y) * 0.55;
+  neckPivot.rotation.x += (pitch - neckPivot.rotation.x) * 0.5;
+  neckPivot.rotation.z += (roll - neckPivot.rotation.z) * 0.5;
 
-  // Vinheta de conforto: escurece as bordas durante giros rápidos, técnica
-  // padrão em apps de VR pra reduzir a sensação de enjoo (motion sickness)
   const speedDeg = Math.abs(THREE.MathUtils.radToDeg(yawVelocity));
   const vignetteStrength = Math.min(0.55, speedDeg / 260);
   document.getElementById('vignette').style.opacity = vignetteStrength.toFixed(2);
 
   document.getElementById('p').textContent = THREE.MathUtils.radToDeg(pitch).toFixed(1);
   document.getElementById('y').textContent = THREE.MathUtils.radToDeg(yaw).toFixed(1);
+  document.getElementById('r').textContent = THREE.MathUtils.radToDeg(roll).toFixed(1);
 
   if (stereoMode) {
     const w = innerWidth, h = innerHeight, halfW = w / 2;
