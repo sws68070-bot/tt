@@ -822,7 +822,10 @@ function opticalFlowTick() {
             // correção antes de qualquer frame renderizar. Por isso o yaw
             // da câmera acumula num ângulo próprio, e é ESSE ângulo que
             // entra na reconstrução do quaternion.
-            noGyroYawDeg += THREE.MathUtils.radToDeg(deltaRad);
+            // Sinal invertido em relação ao deltaRad "cru": o eixo alpha
+            // usado por computeRawDeviceQuaternion gira no sentido oposto
+            // ao que a câmera mede (confirmado: cubo virava ao contrário).
+            noGyroYawDeg -= THREE.MathUtils.radToDeg(deltaRad);
             updateNoGyroOrientation();
           } else if (hasGyroQuaternion) {
             // Caminho principal: corrige o quaternion do giroscópio direto,
