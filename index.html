@@ -336,7 +336,12 @@ function handleMotion(e) {
     const wy = THREE.MathUtils.degToRad(rr.gamma || 0);
     const wz = THREE.MathUtils.degToRad(rr.alpha || 0);
     _gyroAxis.set(wx, wy, wz);
-    const speed = _gyroAxis.length();
+    let speed = _gyroAxis.length();
+    // Sanidade: um pico isolado de sensor (ruído do MEMS, ex: bateu o
+    // celular na lente do visor) não pode virar um salto grande do cubo.
+    // 2000°/s é bem acima de qualquer giro humano real de cabeça/corpo.
+    const MAX_GYRO_SPEED_RAD = THREE.MathUtils.degToRad(2000);
+    if (speed > MAX_GYRO_SPEED_RAD) speed = MAX_GYRO_SPEED_RAD;
     if (speed > 1e-6) {
       _gyroAxis.normalize();
       _gyroDelta.setFromAxisAngle(_gyroAxis, speed * dtMotion);
@@ -382,15 +387,19 @@ const FUSED_CORRECTION_MIN = 0.03;  // correção mínima por leitura (parado)
 const FUSED_CORRECTION_MAX = 0.18;  // correção máxima por leitura (girando rápido usa menos, pra não "puxar")
 const FUSED_SPEED_FOR_MIN_CORRECTION = THREE.MathUtils.degToRad(120); // acima disso, correção fica no mínimo
 const FUSED_STALL_MS = 220; // acima disso a leitura é considerada "atrasada"
-const GLITCH_MIN_ANGLE = THREE.MathUtils.degToRad(18); // abaixo disso nunca é considerado glitch
-const GLITCH_DISAGREEMENT = THREE.MathUtils.degToRad(14); // divergência vs. giroscópio pra rejeitar
-const GLITCH_MAX_STREAK = 6; // depois de tantas rejeições seguidas, aceita mesmo assim (evita travar de vez)
+const TRUST_SOFT_DISAGREEMENT = THREE.MathUtils.degToRad(10); // divergência vs. giroscópio a partir da qual a confiança cai
+const MAX_CORRECTION_STEP_RAD = THREE.MathUtils.degToRad(4); // TETO ABSOLUTO: nunca corrige mais que isso de uma vez, não importa o quão errada a leitura pareça
 
 // feedFusedReading: recebe um quaternion "cru" (mesmo espaço de gyroQuaternion,
 // antes do remap de tela) vindo de QUALQUER fonte fundida — tanto o clássico
-// alpha/beta/gamma quanto a Sensor API nativa — e aplica o filtro complementar
-// com rejeição de outliers. Compartilhado pelas duas fontes pra não duplicar
-// a lógica de correção/anti-glitch.
+// alpha/beta/gamma quanto a Sensor API nativa — e aplica o filtro complementar.
+// Em vez de um "aceita tudo ou rejeita tudo" (que, quando forçava a aceitar
+// depois de várias rejeições seguidas, causava exatamente o pulo/teleporte do
+// cubo pra fora da posição), a confiança agora cai suavemente com a
+// divergência, E além disso existe um TETO fixo de quantos graus a correção
+// pode mover por evento. Isso é o que garante matematicamente que nenhuma
+// leitura ruim — por pior que seja — consegue gerar um salto visível: o pior
+// caso é uma correção de poucos graus, nunca um teleporte.
 function feedFusedReading(rawQuat, now) {
   const dt = Math.max(0.004, (now - lastOrientationTickTime) / 1000);
   const sinceLastFused = lastFusedUpdateTime ? (now - lastFusedUpdateTime) : 0;
@@ -405,46 +414,53 @@ function feedFusedReading(rawQuat, now) {
     lastAcceptedFusedQuaternion.copy(rawQuat);
     hasAcceptedFusedQuaternion = true;
   } else {
-    // ---- Checagem de outlier ANTES de corrigir ----
+    // ---- Confiança suave (não é mais um sim/não binário) ----
     // Compara o quanto essa leitura fundida diz que o aparelho girou desde a
-    // última leitura ACEITA contra o quanto o giroscópio (sem gimbal lock)
-    // mediu no mesmo intervalo. Se as duas contam histórias muito diferentes,
-    // a leitura fundida é o problema (gimbal lock perto de beta≈90° dentro
-    // do VR box, ou bússola perdendo o fix perto do ímã/metal do visor) —
-    // ela é descartada nesse frame em vez de "puxar" a cena pra um valor
-    // errado, que era exatamente o soluço/travada no meio do giro de 360°.
-    let isGlitch = false;
+    // última leitura contra o quanto o giroscópio (sem gimbal lock) mediu no
+    // mesmo intervalo. Quanto mais as duas discordam, menor o peso que essa
+    // leitura recebe — sem nunca chegar a "forçar aceitar" depois de N
+    // rejeições (era isso que causava o teleporte do cubo).
+    let trust = 1;
     if (hasAcceptedFusedQuaternion) {
       _outlierCheckQuat.copy(lastAcceptedFusedQuaternion).invert().multiply(rawQuat);
       const impliedAngle = 2 * Math.acos(THREE.MathUtils.clamp(Math.abs(_outlierCheckQuat.w), -1, 1));
       const gyroImpliedAngle = sensorAngularSpeed * (sinceLastFused > 0 ? sinceLastFused / 1000 : dt);
       const disagreement = Math.abs(impliedAngle - gyroImpliedAngle);
-      isGlitch = impliedAngle > GLITCH_MIN_ANGLE && disagreement > GLITCH_DISAGREEMENT;
+      trust = THREE.MathUtils.clamp(1 - disagreement / TRUST_SOFT_DISAGREEMENT, 0.04, 1);
+      glitchRejectStreak = disagreement > TRUST_SOFT_DISAGREEMENT ? glitchRejectStreak + 1 : 0;
     }
 
-    if (isGlitch && glitchRejectStreak < GLITCH_MAX_STREAK) {
-      glitchRejectStreak++;
-      // ignora a leitura ruim — o giroscópio sozinho já mantém a cena girando liso
-    } else {
-      glitchRejectStreak = 0;
-      // Filtro complementar: puxa o giroscópio integrado de volta pro valor
-      // absoluto aos poucos. Girando rápido, puxa pouco (evita "puxão"/
-      // desvio lateral); parado ou devagar, puxa mais forte (mata a deriva
-      // acumulada do giroscópio, que sozinho deriva com o tempo).
-      const speedFactor = THREE.MathUtils.clamp(sensorAngularSpeed / FUSED_SPEED_FOR_MIN_CORRECTION, 0, 1);
-      let correction = THREE.MathUtils.lerp(FUSED_CORRECTION_MAX, FUSED_CORRECTION_MIN, speedFactor);
-      // Leitura atrasada: só reforça a correção se o aparelho estava QUASE
-      // PARADO enquanto esperava (deriva legítima acumulando devagar). Se
-      // estava girando rápido, uma leitura atrasada é justamente a mais
-      // suspeita de ser stale/glitch — empurrar mais forte nesse caso é o
-      // que causava o "puxão" no meio do giro. Então NÃO reforça.
-      if (sinceLastFused > FUSED_STALL_MS && speedFactor < 0.25) {
-        correction = Math.min(0.5, correction + (sinceLastFused - FUSED_STALL_MS) / 1000);
-      }
-      gyroQuaternion.slerp(rawQuat, correction);
-      lastAcceptedFusedQuaternion.copy(rawQuat);
-      hasAcceptedFusedQuaternion = true;
+    // Filtro complementar: puxa o giroscópio integrado de volta pro valor
+    // absoluto aos poucos. Girando rápido, puxa pouco (evita "puxão"/
+    // desvio lateral); parado ou devagar, puxa mais forte (mata a deriva
+    // acumulada do giroscópio, que sozinho deriva com o tempo).
+    const speedFactor = THREE.MathUtils.clamp(sensorAngularSpeed / FUSED_SPEED_FOR_MIN_CORRECTION, 0, 1);
+    let correction = THREE.MathUtils.lerp(FUSED_CORRECTION_MAX, FUSED_CORRECTION_MIN, speedFactor) * trust;
+
+    // Leitura atrasada: só reforça a correção se o aparelho estava QUASE
+    // PARADO enquanto esperava (deriva legítima acumulando devagar). Girando
+    // rápido, uma leitura atrasada é a mais suspeita de ser stale/glitch —
+    // então não reforça (o teto abaixo protege de qualquer forma).
+    if (sinceLastFused > FUSED_STALL_MS && speedFactor < 0.25) {
+      correction = Math.min(0.3, correction + (sinceLastFused - FUSED_STALL_MS) / 1500);
     }
+
+    // ---- Teto absoluto de correção por evento ----
+    // Não importa o que os cálculos acima deram: a rotação do giroscópio
+    // nunca é puxada mais que MAX_CORRECTION_STEP_RAD de uma vez. Isso é a
+    // garantia final contra qualquer "pulo"/teleporte do cubo.
+    const totalAngle = 2 * Math.acos(THREE.MathUtils.clamp(
+      Math.abs(gyroQuaternion.dot(rawQuat)), -1, 1));
+    if (totalAngle > 1e-5) {
+      const wouldMoveRad = totalAngle * correction;
+      if (wouldMoveRad > MAX_CORRECTION_STEP_RAD) {
+        correction = MAX_CORRECTION_STEP_RAD / totalAngle;
+      }
+    }
+
+    gyroQuaternion.slerp(rawQuat, correction);
+    lastAcceptedFusedQuaternion.copy(rawQuat);
+    hasAcceptedFusedQuaternion = true;
   }
 
   if (hasSensorQuaternion) {
@@ -542,14 +558,17 @@ const DEG_PER_PIXEL_Y = FOV_V_DEG / FINE_H;
 const AGREEMENT_TOLERANCE_PX = 3.5;
 
 const PATCH_HALF = 3;
-const CONSENSUS_TOLERANCE_PX = 1.6;
+const CONSENSUS_TOLERANCE_PX = 1.4;
+const REFINE_CONSENSUS_TOLERANCE_PX = 0.9; // segunda passada, mais rígida, só com os inliers da primeira
 
 const GRID_COLS = 14, GRID_ROWS = 10;
 const CELL_MARGIN = PATCH_HALF + 1;
 const MAX_ACTIVE_POINTS = 60;
-const MIN_ACTIVE_POINTS = 6;
+const MIN_ACTIVE_POINTS = 8;
 const MIN_POINT_SEPARATION = 2.4;
 const VARIANCE_FILTER_THRESHOLD = 45;
+const MAX_CAMERA_YAW_STEP_RAD = THREE.MathUtils.degToRad(6); // teto absoluto por tick da câmera, mesma lógica do sensor fundido
+const MAX_PLAUSIBLE_TICK_SPEED_RAD = THREE.MathUtils.degToRad(700); // acima disso é falha de tracking, não giro real
 
 const CANDIDATE_CELLS = (() => {
   const cells = [];
@@ -749,6 +768,7 @@ function opticalFlowTick() {
     const inlierIds = new Set();
 
     if (results.length >= MIN_ACTIVE_POINTS) {
+      // ---- Passada 1: consenso grosso, filtra outliers óbvios ----
       const roughMedDx = median(results.map(r => r.dx));
       for (const r of results) {
         const wasInlier = Math.abs(r.dx - roughMedDx) <= CONSENSUS_TOLERANCE_PX;
@@ -757,11 +777,27 @@ function opticalFlowTick() {
         nextPointState.set(r.id, { health: newHealth, dx: r.dx, dy: r.dy });
       }
 
-      const weightedItems = results.map(r => ({ value: r.dx, weight: nextPointState.get(r.id).health }));
-      const weightedItemsY = results.map(r => ({ value: r.dy, weight: nextPointState.get(r.id).health }));
-      const medDx = weightedMedian(weightedItems);
-      const medDy = weightedMedian(weightedItemsY);
-      const consensus = inlierIds.size / results.length;
+      // ---- Passada 2: refina usando só os inliers da passada 1 ----
+      // Isso descarta a influência de pontos que passaram raspando no
+      // primeiro filtro, dando uma estimativa bem mais limpa — "melhora ao
+      // máximo" a precisão sem custo extra de busca (reusa os mesmos
+      // resultados do diamond search).
+      const inlierResults = results.filter(r => inlierIds.has(r.id));
+      const refineBase = inlierResults.length >= MIN_ACTIVE_POINTS ? inlierResults : results;
+      const refineMedDx = median(refineBase.map(r => r.dx));
+      const finalInlierIds = new Set();
+      for (const r of refineBase) {
+        if (Math.abs(r.dx - refineMedDx) <= REFINE_CONSENSUS_TOLERANCE_PX) finalInlierIds.add(r.id);
+      }
+      const useIds = finalInlierIds.size >= Math.min(MIN_ACTIVE_POINTS, refineBase.length) ? finalInlierIds : inlierIds;
+
+      const weightedItems = results.filter(r => useIds.has(r.id))
+        .map(r => ({ value: r.dx, weight: nextPointState.get(r.id).health }));
+      const weightedItemsY = results.filter(r => useIds.has(r.id))
+        .map(r => ({ value: r.dy, weight: nextPointState.get(r.id).health }));
+      const medDx = weightedItems.length ? weightedMedian(weightedItems) : roughMedDx;
+      const medDy = weightedItemsY.length ? weightedMedian(weightedItemsY) : 0;
+      const consensus = useIds.size / results.length;
 
       predictedDx = medDx; predictedDy = medDy;
 
@@ -774,7 +810,7 @@ function opticalFlowTick() {
       dxHistory.push(medDx);
       if (dxHistory.length > 30) dxHistory.shift();
 
-      document.getElementById('stillState').textContent = `${inlierIds.size}/${results.length} pts`;
+      document.getElementById('stillState').textContent = `${useIds.size}/${results.length} pts`;
 
       const trust = consensus * (0.5 + 0.5*agreement);
       cameraTrust = trust;
@@ -788,9 +824,25 @@ function opticalFlowTick() {
       // câmera fica só de observadora (mostrado no HUD/debug).
       if (!hasSensorQuaternion && trust > 0.15) {
         const deltaDeg = -medDx * DEG_PER_PIXEL_X;
-        const deltaRad = THREE.MathUtils.degToRad(deltaDeg) * trust;
-        yaw += deltaRad;
-        yawVelocity = yawVelocity * 0.5 + (deltaRad / dt) * 0.5;
+        let deltaRad = THREE.MathUtils.degToRad(deltaDeg) * trust;
+        // ---- Teto absoluto + descarte de pico implausível ----
+        // Um único tick de tracking ruim (ex: motion blur num giro rápido
+        // real, ou perda momentânea de textura) não pode virar um pulo do
+        // cubo. Se o delta implicaria uma velocidade angular fisicamente
+        // implausível pra esse intervalo, é tratado como falha de tracking
+        // (a câmera "errou"), não como movimento real — descarta e decai a
+        // confiança em vez de aplicar.
+        const impliedSpeed = Math.abs(deltaRad) / dt;
+        if (impliedSpeed > MAX_PLAUSIBLE_TICK_SPEED_RAD) {
+          cameraTrust *= 0.3;
+          yawVelocity *= 0.5;
+        } else {
+          if (Math.abs(deltaRad) > MAX_CAMERA_YAW_STEP_RAD) {
+            deltaRad = Math.sign(deltaRad) * MAX_CAMERA_YAW_STEP_RAD;
+          }
+          yaw += deltaRad;
+          yawVelocity = yawVelocity * 0.5 + (deltaRad / dt) * 0.5;
+        }
       } else if (!hasSensorQuaternion) {
         yawVelocity *= 0.6;
       }
@@ -803,6 +855,7 @@ function opticalFlowTick() {
     } else {
       document.getElementById('stillState').textContent = `${results.length} pts (insuficiente)`;
       cameraTrust *= 0.5;
+      if (!hasSensorQuaternion) yawVelocity *= 0.85; // decai suave em vez de continuar extrapolando às cegas
     }
 
     drawTrackDebug(activePoints, inlierIds);
