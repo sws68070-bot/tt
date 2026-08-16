@@ -62,8 +62,8 @@
 
   #camPreview {
     position: fixed; bottom: 8px; left: 8px; width: 96px; height: 72px;
-    border-radius: 8px; border: 2px solid rgba(255,176,32,0.5); z-index: 6;
-    object-fit: cover; opacity: 0.85; transition: opacity 0.2s;
+    border-radius: 8px; border: 2px solid rgba(255,176,32,0.6); z-index: 6;
+    object-fit: cover; opacity: 0.95; transition: opacity 0.2s;
   }
   #camPreview.hidden { opacity: 0; pointer-events: none; }
 
@@ -72,6 +72,13 @@
     background: radial-gradient(circle, transparent 45%, rgba(0,0,0,0.85) 100%);
     transition: opacity 0.08s linear;
   }
+
+  #trackCanvas {
+    position: fixed; bottom: 8px; left: 112px; width: 96px; height: 72px;
+    border-radius: 8px; border: 2px solid rgba(120,220,255,0.5); z-index: 6;
+    opacity: 0.95; transition: opacity 0.2s; image-rendering: pixelated;
+  }
+  #trackCanvas.hidden { opacity: 0; pointer-events: none; }
 </style>
 </head>
 <body>
@@ -79,10 +86,11 @@
 <div id="vignette"></div>
 <div id="hud">
   yaw: <span id="y">0.0</span>° · pitch: <span id="p">0.0</span>° · roll: <span id="r">0.0</span>°<br>
-  <span id="modeY">-</span>
+  <span id="modeY">-</span> · <span id="stillState">-</span>
 </div>
 <div id="reticle"></div>
 <video id="camPreview" playsinline autoplay muted></video>
+<canvas id="trackCanvas" width="48" height="36"></canvas>
 <div id="eyeDivider"></div>
 
 <div id="topControls">
@@ -99,15 +107,14 @@
   <h2>VR Box — Cubo</h2>
   <p>
     Deite o celular na horizontal, ative os sensores, entre em tela cheia e
-    encaixe no visor. A rotação agora vem direto da orientação fundida do
-    aparelho (o mesmo dado que giroscópio+acelerômetro+bússola do sistema
-    já calculam) — sem travas, sem desvio lateral, acompanha o celular 1:1
-    em qualquer giro, inclusive 360° completos.
+    encaixe no visor.
   </p>
   <p style="font-size:11px; color:rgba(120,220,255,0.85)">
-    A câmera aparece só como preview, não influencia mais a rotação — ela
-    era a causa da trava e do desvio pro lado dentro da caixa de VR
-    (perde referência com a câmera tampada ou em giro rápido).
+    A rotação combina o giroscópio bruto (integrado a cada frame, sem
+    depender de evento algum) com a orientação absoluta fundida do celular
+    como correção lenta de deriva — filtro complementar clássico de IMU.
+    Isso acompanha giros de 360° rápidos sem travar, mesmo se a bússola
+    perder o fix por um instante.
   </p>
   <div>
     <button id="startBtn">Ativar sensores</button>
@@ -203,68 +210,499 @@ function resize() {
 addEventListener('resize', resize);
 resize();
 
-// ================================================================
-// ORIENTAÇÃO DO APARELHO -> QUATERNION
-// ================================================================
-// Esta é a mesma conversão usada no THREE.DeviceOrientationControls
-// (baseada no algoritmo de referência do W3C Device Orientation spec).
-// Ela transforma alpha/beta/gamma (que vêm já fundidos pelo sistema a
-// partir de giroscópio + acelerômetro + bússola) direto num quaternion
-// 3D, e compensa o ângulo de rotação da tela (screen.orientation.angle).
-//
-// Por que isso resolve a trava e o desvio pro lado:
-//   - Não existe NENHUM clamp no yaw aqui — o quaternion não tem limite
-//     de ângulo, então um giro de 360°, 720°, quantos forem, é sempre
-//     representado corretamente, sem travar em nenhum ponto.
-//   - A compensação de screen.orientation.angle é o que fazia o cubo
-//     "ir pro lado": sem ela, girar o celular pra paisagem (necessário
-//     pra encaixar na caixa de VR) troca o significado de beta/gamma e
-//     introduz um desvio constante. Com a compensação, o resultado é
-//     idêntico em retrato ou paisagem.
-//   - Não depende de bússola isolada nem de rastreio de câmera pra
-//     girar — é só a orientação nativa do aparelho, direto.
-const DEG2RAD = Math.PI / 180;
-const _zee = new THREE.Vector3(0, 0, 1);
+// ================= Orientação primária: sensor fundido (giroscópio) =================
+// A maioria dos celulares expõe em `deviceorientation` um ângulo já fundido
+// pelo próprio sistema operacional a partir do giroscópio + acelerômetro +
+// bússola ("rotation vector sensor"). Isso é MUITO mais rápido e suave que
+// tentar reconstruir a rotação via câmera, e não sofre com blur de giro
+// rápido — é a mesma fonte de dado que qualquer app nativo de VR usa.
+// Convertendo alpha/beta/gamma pra quaternion (mesma matemática do clássico
+// THREE.DeviceOrientationControls) e aplicando direto no pivô da cabeça, o
+// app passa a acompanhar o celular 1:1, incluindo giros de 360° completos.
+const _zeeAxis = new THREE.Vector3(0, 0, 1);
 const _euler = new THREE.Euler();
 const _q0 = new THREE.Quaternion();
 const _q1 = new THREE.Quaternion(-Math.sqrt(0.5), 0, 0, Math.sqrt(0.5)); // -90° em X
 
-function deviceOrientationToQuaternion(out, alphaDeg, betaDeg, gammaDeg, screenAngleRad) {
-  const alpha = alphaDeg ? alphaDeg * DEG2RAD : 0;
-  const beta  = betaDeg  ? betaDeg  * DEG2RAD : 0;
-  const gamma = gammaDeg ? gammaDeg * DEG2RAD : 0;
+function screenOrientRad() {
+  const angle = (screen.orientation && typeof screen.orientation.angle === 'number')
+    ? screen.orientation.angle
+    : (typeof window.orientation === 'number' ? window.orientation : 0);
+  return THREE.MathUtils.degToRad(angle);
+}
+
+// computeRawDeviceQuaternion: converte alpha/beta/gamma pro quaternion "cru"
+// do aparelho, SEM o remap de câmera/tela. Esse quaternion cru é o mesmo
+// espaço em que o giroscópio (rotationRate) integra, então dá pra somar
+// os dois. O remap (q1 + correção de orientação da tela) só é aplicado na
+// hora de exibir, em applyDisplayRemap.
+function computeRawDeviceQuaternion(alphaDeg, betaDeg, gammaDeg, target) {
+  const alpha = THREE.MathUtils.degToRad(alphaDeg);
+  const beta = THREE.MathUtils.degToRad(betaDeg);
+  const gamma = THREE.MathUtils.degToRad(gammaDeg);
   _euler.set(beta, alpha, -gamma, 'YXZ');
-  out.setFromEuler(_euler);
-  out.multiply(_q1); // a "câmera" olha pra fora das costas do aparelho, não pra tela
-  out.multiply(_q0.setFromAxisAngle(_zee, -screenAngleRad)); // compensa retrato/paisagem
-  return out;
+  target.setFromEuler(_euler);
+  return target;
 }
 
-function getScreenAngleRad() {
-  let angle = 0;
-  if (screen.orientation && typeof screen.orientation.angle === 'number') {
-    angle = screen.orientation.angle;
-  } else if (typeof window.orientation === 'number') {
-    angle = window.orientation;
+function applyDisplayRemap(rawQuaternion, target) {
+  target.copy(rawQuaternion);
+  target.multiply(_q1);
+  target.multiply(_q0.setFromAxisAngle(_zeeAxis, -screenOrientRad()));
+  return target;
+}
+
+// ---- Giroscópio integrado (fonte principal de rotação a cada frame) ----
+// Em vez de só usar o ângulo absoluto que chega no evento `deviceorientation`
+// (que depende da bússola/magnetômetro e pode travar/atrasar alguns
+// instantes, sobretudo perto de metal/ímã do próprio VR box), o giroscópio
+// bruto (`devicemotion.rotationRate`, em °/s) é integrado a CADA frame,
+// então a cena nunca "para" no meio de um giro rápido. A leitura absoluta
+// fundida (deviceorientation) só entra como correção lenta de deriva —
+// filtro complementar clássico de IMU — puxando o giroscópio de volta pro
+// valor "verdadeiro" aos poucos, sem dar o "puxão"/salto perceptível.
+const gyroQuaternion = new THREE.Quaternion(); // espaço cru do aparelho, integrado pelo giroscópio
+let hasGyroQuaternion = false;
+let lastMotionTickTime = performance.now();
+const _rawFusedQuaternion = new THREE.Quaternion();
+const _gyroDelta = new THREE.Quaternion();
+const _gyroAxis = new THREE.Vector3();
+let lastFusedUpdateTime = 0;
+let fusedUpdateIntervalAvg = 60; // ms — usado só pra diagnosticar "travou"
+
+let sensorQuaternion = new THREE.Quaternion(); // mantido por compatibilidade (raw fundido mais recente)
+let hasSensorQuaternion = false;
+let lastSensorQuaternion = new THREE.Quaternion();
+let sensorAngularSpeed = 0; // rad/s — velocidade real de giro do aparelho
+let lastOrientationTickTime = performance.now();
+let calibInverseQuaternion = new THREE.Quaternion(); // recentralização
+const displayQuaternion = new THREE.Quaternion(); // aplicado ao pivô, com recentralização
+const _remappedGyro = new THREE.Quaternion(); // escrátch pra remap do gyroQuaternion
+
+// ---- Fallback (sem orientação fundida completa): pitch bruto do acelerômetro ----
+let rawPitch = 0, rawRoll = 0;
+let pitch = 0, roll = 0, yaw = 0; // usados só no modo de contingência (ver abaixo)
+let pitchOffset = 0, rollOffset = 0;
+const MAX_PITCH = THREE.MathUtils.degToRad(85);
+const MAX_ROLL = THREE.MathUtils.degToRad(80);
+
+// ================= Acelerômetro: detecção de "parado" (usado p/ debug/estabilidade) =================
+let fx = 0, fy = 0, fz = 0, accelFirst = true;
+const ALPHA_LP = 0.15;
+const MAG_HISTORY_SIZE = 12;
+let magHistory = [];
+let stillCounter = 0;
+const STILL_FRAMES_REQUIRED = 18;
+const STILL_VARIANCE_LIMIT = 0.04;
+let isStill = false;
+
+function handleMotion(e) {
+  // ---- Integração do giroscópio bruto (rotationRate, °/s) ----
+  // Isso roda a cada evento devicemotion (tipicamente 60Hz+), independente
+  // da leitura fundida/bússola do deviceorientation — é o que garante que
+  // um giro de 360° rápido nunca "trava": mesmo se a bússola atrasar ou
+  // perder o fix, o giroscópio sozinho já mantém a cena acompanhando o
+  // aparelho, porque é velocidade angular física medida direto no MEMS.
+  const rr = e.rotationRate;
+  const nowMotion = performance.now();
+  const dtMotion = Math.max(0.001, Math.min(0.1, (nowMotion - lastMotionTickTime) / 1000));
+  lastMotionTickTime = nowMotion;
+
+  if (rr && (typeof rr.alpha === 'number' || typeof rr.beta === 'number' || typeof rr.gamma === 'number') && hasGyroQuaternion) {
+    // rotationRate.beta = giro em torno do eixo X do aparelho (°/s)
+    // rotationRate.gamma = giro em torno do eixo Y do aparelho (°/s)
+    // rotationRate.alpha = giro em torno do eixo Z do aparelho (°/s)
+    // Mesma convenção de eixos usada em alpha/beta/gamma de orientação,
+    // então dá pra integrar direto no espaço "cru" do gyroQuaternion.
+    const wx = THREE.MathUtils.degToRad(rr.beta || 0);
+    const wy = THREE.MathUtils.degToRad(rr.gamma || 0);
+    const wz = THREE.MathUtils.degToRad(rr.alpha || 0);
+    _gyroAxis.set(wx, wy, wz);
+    const speed = _gyroAxis.length();
+    if (speed > 1e-6) {
+      _gyroAxis.normalize();
+      _gyroDelta.setFromAxisAngle(_gyroAxis, speed * dtMotion);
+      // multiplicação à direita: delta é expresso no referencial local
+      // (do próprio aparelho), então compõe "depois" da orientação atual.
+      gyroQuaternion.multiply(_gyroDelta);
+    }
+    sensorAngularSpeed = sensorAngularSpeed * 0.8 + speed * 0.2;
   }
-  return angle * DEG2RAD;
+
+  const g = e.accelerationIncludingGravity;
+  if (!g || typeof g.x !== 'number') return;
+
+  const mag = Math.sqrt(g.x*g.x + g.y*g.y + g.z*g.z);
+  magHistory.push(mag);
+  if (magHistory.length > MAG_HISTORY_SIZE) magHistory.shift();
+  if (magHistory.length === MAG_HISTORY_SIZE) {
+    const mean = magHistory.reduce((a,b)=>a+b,0) / magHistory.length;
+    const variance = magHistory.reduce((a,b)=>a+(b-mean)*(b-mean),0) / magHistory.length;
+    if (variance < STILL_VARIANCE_LIMIT) stillCounter++; else stillCounter = 0;
+    isStill = stillCounter >= STILL_FRAMES_REQUIRED;
+  }
+
+  // Só alimenta o pitch bruto de fallback se a orientação fundida não estiver disponível.
+  if (hasSensorQuaternion) return;
+
+  if (accelFirst) { fx=g.x; fy=g.y; fz=g.z; accelFirst=false; }
+  else {
+    fx += (g.x - fx) * ALPHA_LP;
+    fy += (g.y - fy) * ALPHA_LP;
+    fz += (g.z - fz) * ALPHA_LP;
+  }
+  rawPitch = Math.atan2(-fx, Math.sqrt(fy*fy + fz*fz));
+  pitch = THREE.MathUtils.clamp(rawPitch - pitchOffset, -MAX_PITCH, MAX_PITCH);
 }
 
-let haveOrientationData = false;
-let lastAlpha = 0, lastBeta = 0, lastGamma = 0;
-const rawQuat = new THREE.Quaternion();
-const calibQuat = new THREE.Quaternion(); // offset aplicado ao recentralizar
-const outQuat = new THREE.Quaternion();
+// ---- Yaw por bússola (fallback contínuo, só usado se não houver quaternion fundido) ----
+let yawCompassOffset = null;
+let yawCompassRaw = 0;
+let hasCompassYaw = false;
+
+const FUSED_CORRECTION_MIN = 0.03;  // correção mínima por leitura (parado)
+const FUSED_CORRECTION_MAX = 0.18;  // correção máxima por leitura (girando rápido usa menos, pra não "puxar")
+const FUSED_SPEED_FOR_MIN_CORRECTION = THREE.MathUtils.degToRad(120); // acima disso, correção fica no mínimo
+const FUSED_STALL_MS = 220; // se a leitura fundida atrasar mais que isso, ela "pesa mais" quando finalmente chega
 
 function handleOrientation(e) {
-  if (typeof e.alpha !== 'number' || e.alpha === null) return; // sem dado utilizável
-  haveOrientationData = true;
-  lastAlpha = e.alpha; lastBeta = e.beta || 0; lastGamma = e.gamma || 0;
+  if (typeof e.alpha === 'number' && typeof e.beta === 'number' && typeof e.gamma === 'number') {
+    computeRawDeviceQuaternion(e.alpha, e.beta, e.gamma, _rawFusedQuaternion);
+    sensorQuaternion.copy(_rawFusedQuaternion); // mantido pra compat (HUD/recentralizar)
+
+    const now = performance.now();
+    const dt = Math.max(0.004, (now - lastOrientationTickTime) / 1000);
+    const sinceLastFused = lastFusedUpdateTime ? (now - lastFusedUpdateTime) : 0;
+    lastOrientationTickTime = now;
+    lastFusedUpdateTime = now;
+
+    if (!hasGyroQuaternion) {
+      // primeira leitura: giroscópio parte exatamente da orientação fundida
+      gyroQuaternion.copy(_rawFusedQuaternion);
+      hasGyroQuaternion = true;
+      hasSensorQuaternion = true;
+    } else {
+      // Filtro complementar: puxa o giroscópio integrado de volta pro valor
+      // absoluto aos poucos. Girando rápido, puxa pouco (evita "puxão"/
+      // desvio lateral); parado ou devagar, puxa mais forte (mata a deriva
+      // acumulada do giroscópio, que sozinho deriva com o tempo).
+      // Se a leitura atrasou (stall de bússola), dá um empurrão extra
+      // proporcional ao atraso pra recolocar o giroscópio nos trilhos.
+      const speedFactor = THREE.MathUtils.clamp(sensorAngularSpeed / FUSED_SPEED_FOR_MIN_CORRECTION, 0, 1);
+      let correction = THREE.MathUtils.lerp(FUSED_CORRECTION_MAX, FUSED_CORRECTION_MIN, speedFactor);
+      if (sinceLastFused > FUSED_STALL_MS) {
+        correction = Math.min(0.6, correction + (sinceLastFused - FUSED_STALL_MS) / 1000);
+      }
+      gyroQuaternion.slerp(_rawFusedQuaternion, correction);
+    }
+
+    if (hasSensorQuaternion) {
+      // ângulo entre a leitura anterior e a atual -> velocidade angular real
+      // (só usado aqui como referência adicional; a fonte principal de
+      // sensorAngularSpeed agora é o rotationRate em handleMotion)
+      const dq = lastSensorQuaternion.clone().invert().multiply(_rawFusedQuaternion);
+      const w = THREE.MathUtils.clamp(Math.abs(dq.w), -1, 1);
+      const angle = 2 * Math.acos(w);
+      const instSpeed = angle / dt;
+      if (instSpeed < THREE.MathUtils.degToRad(400)) {
+        // ignora picos absurdos (ex: leitura atrasada acumulando ângulo)
+        sensorAngularSpeed = sensorAngularSpeed * 0.85 + instSpeed * 0.15;
+      }
+    }
+    lastSensorQuaternion.copy(_rawFusedQuaternion);
+  }
+
+  // bússola crua — só vira o driver de yaw se o quaternion fundido nunca chegar
+  if (typeof e.alpha === 'number') {
+    yawCompassRaw = THREE.MathUtils.degToRad(360 - e.alpha);
+    hasCompassYaw = true;
+    if (yawCompassOffset === null) yawCompassOffset = yaw - yawCompassRaw;
+  }
 }
 
-// ================= Câmera: só preview visual (não afeta rotação) =================
+// ================= Câmera: reforço leve/opcional pro yaw =================
+// Continua rodando (útil como fallback em navegadores sem orientação fundida
+// completa, e como painel de debug), mas só é somado à rotação principal
+// quando NÃO há quaternion de sensor disponível — em giro rápido de 360°,
+// a imagem borra e a câmera erra; por isso ela nunca mais domina a rotação.
+const FINE_W = 48, FINE_H = 36;
+const FOV_H_DEG = 60;
+const FOV_V_DEG = FOV_H_DEG * (FINE_H / FINE_W);
+const DEG_PER_PIXEL_X = FOV_H_DEG / FINE_W;
+const DEG_PER_PIXEL_Y = FOV_V_DEG / FINE_H;
+const AGREEMENT_TOLERANCE_PX = 3.5;
+
+const PATCH_HALF = 3;
+const CONSENSUS_TOLERANCE_PX = 1.6;
+
+const GRID_COLS = 14, GRID_ROWS = 10;
+const CELL_MARGIN = PATCH_HALF + 1;
+const MAX_ACTIVE_POINTS = 60;
+const MIN_ACTIVE_POINTS = 6;
+const MIN_POINT_SEPARATION = 2.4;
+const VARIANCE_FILTER_THRESHOLD = 45;
+
+const CANDIDATE_CELLS = (() => {
+  const cells = [];
+  const usableW = FINE_W - 2 * CELL_MARGIN;
+  const usableH = FINE_H - 2 * CELL_MARGIN;
+  for (let r = 0; r < GRID_ROWS; r++) {
+    for (let c = 0; c < GRID_COLS; c++) {
+      const x = Math.round(CELL_MARGIN + (c + 0.5) * usableW / GRID_COLS);
+      const y = Math.round(CELL_MARGIN + (r + 0.5) * usableH / GRID_ROWS);
+      cells.push({ id: r * GRID_COLS + c, x, y });
+    }
+  }
+  return cells;
+})();
+
+let pointState = new Map();
 let cameraActive = false;
+let opticalFlowLoopActive = false;
+let lastOpticalFlowTickTime = 0;
+const OPTICAL_FLOW_MIN_INTERVAL_MS = 70;
 const videoEl = document.getElementById('camPreview');
+const trackCanvas = document.getElementById('trackCanvas');
+const trackCtx = trackCanvas.getContext('2d');
+
+const fineCanvas = document.createElement('canvas');
+fineCanvas.width = FINE_W; fineCanvas.height = FINE_H;
+const fineCtx = fineCanvas.getContext('2d', { willReadFrequently: true });
+let prevFine = null;
+
+let predictedDx = 0, predictedDy = 0;
+let dxHistory = [];
+let cameraTrust = 0;
+let prevRawPitchAtTick = 0;
+
+function toGray(ctx, w, h) {
+  const data = ctx.getImageData(0, 0, w, h).data;
+  const gray = new Float32Array(w * h);
+  for (let i = 0; i < w * h; i++) {
+    gray[i] = 0.299*data[i*4] + 0.587*data[i*4+1] + 0.114*data[i*4+2];
+  }
+  return gray;
+}
+
+function buildIntegral(gray, w, h) {
+  const stride = w + 1;
+  const integral = new Float64Array(stride * (h + 1));
+  const integralSq = new Float64Array(stride * (h + 1));
+  for (let y = 0; y < h; y++) {
+    let rowSum = 0, rowSumSq = 0;
+    const rowAbove = y * stride;
+    const rowHere = (y + 1) * stride;
+    for (let x = 0; x < w; x++) {
+      const v = gray[y * w + x];
+      rowSum += v; rowSumSq += v * v;
+      integral[rowHere + x + 1] = integral[rowAbove + x + 1] + rowSum;
+      integralSq[rowHere + x + 1] = integralSq[rowAbove + x + 1] + rowSumSq;
+    }
+  }
+  return { integral, integralSq, stride };
+}
+
+function boxVariance(ii, cx, cy, half) {
+  const { integral, integralSq, stride } = ii;
+  const x0 = cx - half, x1 = cx + half + 1, y0 = cy - half, y1 = cy + half + 1;
+  const sum = integral[y1*stride+x1] - integral[y0*stride+x1] - integral[y1*stride+x0] + integral[y0*stride+x0];
+  const sumSq = integralSq[y1*stride+x1] - integralSq[y0*stride+x1] - integralSq[y1*stride+x0] + integralSq[y0*stride+x0];
+  const n = (x1 - x0) * (y1 - y0);
+  const mean = sum / n;
+  return sumSq / n - mean * mean;
+}
+
+function patchSAD(prev, curr, w, h, px, py, dx, dy) {
+  const sx = px + dx, sy = py + dy;
+  if (sx - PATCH_HALF < 0 || sx + PATCH_HALF >= w || sy - PATCH_HALF < 0 || sy + PATCH_HALF >= h) return Infinity;
+  let sad = 0;
+  for (let yy = -PATCH_HALF; yy <= PATCH_HALF; yy++) {
+    const curRow = (py + yy) * w;
+    const refRow = (sy + yy) * w;
+    for (let xx = -PATCH_HALF; xx <= PATCH_HALF; xx++) {
+      sad += Math.abs(curr[curRow + px + xx] - prev[refRow + sx + xx]);
+    }
+  }
+  return sad;
+}
+
+const LDSP = [[-2,0],[2,0],[0,-2],[0,2],[-1,-1],[1,-1],[-1,1],[1,1]];
+const SDSP = [[-1,0],[1,0],[0,-1],[0,1]];
+const MAX_DIAMOND_STEPS = 6;
+
+function diamondSearch(prev, curr, w, h, px, py, seedDx, seedDy) {
+  let cx = Math.round(seedDx), cy = Math.round(seedDy);
+  let bestSad = patchSAD(prev, curr, w, h, px, py, cx, cy);
+  for (let step = 0; step < MAX_DIAMOND_STEPS; step++) {
+    let bestDx = cx, bestDy = cy, improved = false;
+    for (const [ox, oy] of LDSP) {
+      const dx = cx + ox, dy = cy + oy;
+      const sad = patchSAD(prev, curr, w, h, px, py, dx, dy);
+      if (sad < bestSad) { bestSad = sad; bestDx = dx; bestDy = dy; improved = true; }
+    }
+    cx = bestDx; cy = bestDy;
+    if (!improved) break;
+  }
+  let bestDx = cx, bestDy = cy;
+  for (const [ox, oy] of SDSP) {
+    const dx = cx + ox, dy = cy + oy;
+    const sad = patchSAD(prev, curr, w, h, px, py, dx, dy);
+    if (sad < bestSad) { bestSad = sad; bestDx = dx; bestDy = dy; }
+  }
+  const patchSize = (PATCH_HALF * 2 + 1) * (PATCH_HALF * 2 + 1);
+  return { dx: bestDx, dy: bestDy, avgSad: bestSad === Infinity ? Infinity : bestSad / patchSize };
+}
+
+function median(arr) {
+  const s = [...arr].sort((a,b)=>a-b);
+  const mid = Math.floor(s.length/2);
+  return s.length % 2 ? s[mid] : (s[mid-1]+s[mid])/2;
+}
+
+let audioCtx = null;
+let lastBeepTime = 0;
+let wasTrackingGood = true;
+function beep(freq, durationMs) {
+  try {
+    if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    const osc = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+    osc.frequency.value = freq;
+    gain.gain.setValueAtTime(0.06, audioCtx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + durationMs/1000);
+    osc.connect(gain); gain.connect(audioCtx.destination);
+    osc.start(); osc.stop(audioCtx.currentTime + durationMs/1000);
+  } catch (e) {}
+}
+
+function weightedMedian(items) {
+  const sorted = [...items].sort((a,b) => a.value - b.value);
+  const totalWeight = sorted.reduce((s,i) => s + i.weight, 0);
+  let acc = 0;
+  for (const it of sorted) {
+    acc += it.weight;
+    if (acc >= totalWeight / 2) return it.value;
+  }
+  return sorted[sorted.length - 1].value;
+}
+
+let yawVelocity = 0;
+let lastYawTickTime = performance.now();
+
+function selectActivePoints(ii) {
+  const scored = [];
+  for (const cell of CANDIDATE_CELLS) {
+    const variance = boxVariance(ii, cell.x, cell.y, PATCH_HALF);
+    if (variance >= VARIANCE_FILTER_THRESHOLD) scored.push({ cell, variance });
+  }
+  scored.sort((a, b) => b.variance - a.variance);
+
+  const active = [];
+  const minSepSq = MIN_POINT_SEPARATION * MIN_POINT_SEPARATION;
+  for (const s of scored) {
+    if (active.length >= MAX_ACTIVE_POINTS) break;
+    let tooClose = false;
+    for (const p of active) {
+      const ddx = p.x - s.cell.x, ddy = p.y - s.cell.y;
+      if (ddx*ddx + ddy*ddy < minSepSq) { tooClose = true; break; }
+    }
+    if (!tooClose) active.push(s.cell);
+  }
+  return active;
+}
+
+function drawTrackDebug(activePoints, inlierIds) {
+  trackCtx.drawImage(videoEl, 0, 0, FINE_W, FINE_H);
+  for (const cell of activePoints) {
+    trackCtx.fillStyle = inlierIds.has(cell.id) ? 'rgba(120,255,170,0.9)' : 'rgba(255,90,90,0.8)';
+    trackCtx.fillRect(cell.x - 1, cell.y - 1, 2, 2);
+  }
+}
+
+function opticalFlowTick() {
+  if (!cameraActive) return;
+  fineCtx.drawImage(videoEl, 0, 0, FINE_W, FINE_H);
+  const currFine = toGray(fineCtx, FINE_W, FINE_H);
+
+  if (prevFine) {
+    const ii = buildIntegral(currFine, FINE_W, FINE_H);
+    const activePoints = selectActivePoints(ii);
+
+    const results = [];
+    for (const cell of activePoints) {
+      const state = pointState.get(cell.id) || { health: 1.0, dx: predictedDx, dy: predictedDy };
+      const r = diamondSearch(prevFine, currFine, FINE_W, FINE_H, cell.x, cell.y, state.dx, state.dy);
+      if (r.avgSad === Infinity) continue;
+      results.push({ id: cell.id, x: cell.x, y: cell.y, dx: r.dx, dy: r.dy, health: state.health });
+    }
+
+    const nextPointState = new Map();
+    const inlierIds = new Set();
+
+    if (results.length >= MIN_ACTIVE_POINTS) {
+      const roughMedDx = median(results.map(r => r.dx));
+      for (const r of results) {
+        const wasInlier = Math.abs(r.dx - roughMedDx) <= CONSENSUS_TOLERANCE_PX;
+        if (wasInlier) inlierIds.add(r.id);
+        const newHealth = THREE.MathUtils.clamp(r.health + (wasInlier ? 0.08 : -0.25), 0.05, 1.0);
+        nextPointState.set(r.id, { health: newHealth, dx: r.dx, dy: r.dy });
+      }
+
+      const weightedItems = results.map(r => ({ value: r.dx, weight: nextPointState.get(r.id).health }));
+      const weightedItemsY = results.map(r => ({ value: r.dy, weight: nextPointState.get(r.id).health }));
+      const medDx = weightedMedian(weightedItems);
+      const medDy = weightedMedian(weightedItemsY);
+      const consensus = inlierIds.size / results.length;
+
+      predictedDx = medDx; predictedDy = medDy;
+
+      const accelPitchDeltaDeg = THREE.MathUtils.radToDeg(rawPitch - prevRawPitchAtTick);
+      const expectedVerticalPx = accelPitchDeltaDeg / DEG_PER_PIXEL_Y;
+      const verticalDiff = Math.abs(medDy - expectedVerticalPx);
+      const agreement = Math.max(0, 1 - verticalDiff / AGREEMENT_TOLERANCE_PX);
+      prevRawPitchAtTick = rawPitch;
+
+      dxHistory.push(medDx);
+      if (dxHistory.length > 30) dxHistory.shift();
+
+      document.getElementById('stillState').textContent = `${inlierIds.size}/${results.length} pts`;
+
+      const trust = consensus * (0.5 + 0.5*agreement);
+      cameraTrust = trust;
+
+      const now = performance.now();
+      const dt = Math.max(0.02, (now - lastYawTickTime) / 1000);
+      lastYawTickTime = now;
+
+      // Só escreve na rotação principal (yaw escalar) quando estamos no
+      // modo de contingência sem sensor fundido — em modo giroscópio a
+      // câmera fica só de observadora (mostrado no HUD/debug).
+      if (!hasSensorQuaternion && trust > 0.15) {
+        const deltaDeg = -medDx * DEG_PER_PIXEL_X;
+        const deltaRad = THREE.MathUtils.degToRad(deltaDeg) * trust;
+        yaw += deltaRad;
+        yawVelocity = yawVelocity * 0.5 + (deltaRad / dt) * 0.5;
+      } else if (!hasSensorQuaternion) {
+        yawVelocity *= 0.6;
+      }
+
+      const trackingGoodNow = consensus > 0.5;
+      if (wasTrackingGood && !trackingGoodNow && performance.now() - lastBeepTime > 1500) {
+        beep(280, 150); lastBeepTime = performance.now();
+      }
+      wasTrackingGood = trackingGoodNow;
+    } else {
+      document.getElementById('stillState').textContent = `${results.length} pts (insuficiente)`;
+      cameraTrust *= 0.5;
+    }
+
+    drawTrackDebug(activePoints, inlierIds);
+    pointState = nextPointState;
+  } else {
+    cameraTrust = 0;
+  }
+  prevFine = currFine;
+}
 
 async function startCamera() {
   try {
@@ -274,20 +712,40 @@ async function startCamera() {
     videoEl.srcObject = stream;
     await videoEl.play();
     cameraActive = true;
+    opticalFlowLoopActive = true;
   } catch (err) {
     showCameraError(err);
   }
 }
 
 function showCameraError(err) {
-  document.getElementById('camPreview').classList.add('hidden');
+  const box = document.createElement('div');
+  box.style.cssText = 'position:fixed;inset:0;z-index:30;background:rgba(5,7,10,0.97);'
+    + 'color:#fff;display:flex;flex-direction:column;align-items:center;justify-content:center;'
+    + 'text-align:center;padding:24px;font-size:13px;line-height:1.6;';
+  box.innerHTML = '<div style="font-size:32px;margin-bottom:10px">📷🚫</div>'
+    + '<b>Câmera bloqueada pra este site</b><br>'
+    + 'Toque no ícone de cadeado ao lado do endereço → Permissões → Câmera → Permitir.<br>'
+    + 'Depois feche esta aba e abra de novo.<br>'
+    + '<span style="opacity:0.6;font-size:11px;margin-top:8px;display:block">erro técnico: ' + (err.message || err.name || err) + '</span>'
+    + '<button id="dismissCamErr" style="margin-top:16px;padding:10px 20px;border-radius:8px;border:none;background:#ffb020;color:#071018;font-weight:700">Continuar sem câmera</button>';
+  document.body.appendChild(box);
+  document.getElementById('dismissCamErr').addEventListener('click', () => box.remove());
 }
 
 // ================= Recentralizar =================
 document.getElementById('calibBtn').addEventListener('click', () => {
-  // guarda o inverso do quaternion bruto atual: passa a ser o novo "zero"
-  deviceOrientationToQuaternion(rawQuat, lastAlpha, lastBeta, lastGamma, getScreenAngleRad());
-  calibQuat.copy(rawQuat).invert();
+  if (hasGyroQuaternion) {
+    applyDisplayRemap(gyroQuaternion, _remappedGyro);
+    calibInverseQuaternion.copy(_remappedGyro).invert();
+  } else {
+    yaw = 0;
+    yawCompassOffset = null;
+    pitchOffset = rawPitch;
+    pitch = 0;
+    rollOffset = rawRoll;
+    roll = 0;
+  }
   if (navigator.vibrate) navigator.vibrate(30);
 });
 
@@ -298,7 +756,7 @@ async function requestWakeLock() {
   catch (err) {}
 }
 document.addEventListener('visibilitychange', () => {
-  if (document.visibilityState === 'visible' && sensorsStarted) requestWakeLock();
+  if (document.visibilityState === 'visible' && cameraActive) requestWakeLock();
 });
 
 // ================= Modo VR: tela cheia + paisagem + estéreo =================
@@ -314,6 +772,7 @@ async function enterVrMode() {
   document.getElementById('exitVrBtn').style.display = 'inline-block';
   document.getElementById('overlay').style.display = 'none';
   document.getElementById('camPreview').classList.add('hidden');
+  trackCanvas.classList.add('hidden');
   rotateHint.classList.add('armed');
   resize();
 }
@@ -326,6 +785,7 @@ function exitVrMode() {
   document.getElementById('reticle').style.display = 'none';
   document.getElementById('exitVrBtn').style.display = 'none';
   document.getElementById('camPreview').classList.remove('hidden');
+  trackCanvas.classList.remove('hidden');
   rotateHint.classList.remove('armed');
   resize();
 }
@@ -338,12 +798,25 @@ async function startSensors() {
   if (sensorsStarted) return;
   const needsOrientPerm = typeof DeviceOrientationEvent !== 'undefined'
     && typeof DeviceOrientationEvent.requestPermission === 'function';
+  const needsMotionPerm = typeof DeviceMotionEvent !== 'undefined'
+    && typeof DeviceMotionEvent.requestPermission === 'function';
   try {
     if (needsOrientPerm) await DeviceOrientationEvent.requestPermission();
+    if (needsMotionPerm) await DeviceMotionEvent.requestPermission();
   } catch (err) { console.warn(err); }
 
-  window.addEventListener('deviceorientation', handleOrientation, true);
-  startCamera(); // não bloqueia — é só preview
+  // Prefere 'deviceorientationabsolute' quando o navegador suporta: em
+  // vários Androids ela entrega uma leitura mais estável (sempre referenciada
+  // ao mundo real) do que 'deviceorientation' puro, que em alguns aparelhos
+  // pode vir relativa e re-basear sozinha, causando saltos. Não faz mal
+  // escutar as duas — o handler é idempotente por evento.
+  if ('ondeviceorientationabsolute' in window) {
+    window.addEventListener('deviceorientationabsolute', handleOrientation, true);
+  } else {
+    window.addEventListener('deviceorientation', handleOrientation, true);
+  }
+  window.addEventListener('devicemotion', handleMotion, true);
+  await startCamera();
   await requestWakeLock();
   sensorsStarted = true;
 }
@@ -359,25 +832,72 @@ document.getElementById('vrBtn').addEventListener('click', async () => {
 });
 
 // ================= Loop =================
-const eulerReadout = new THREE.Euler();
+const _hudEuler = new THREE.Euler();
 
 function animate() {
   requestAnimationFrame(animate);
 
-  if (haveOrientationData) {
-    deviceOrientationToQuaternion(rawQuat, lastAlpha, lastBeta, lastGamma, getScreenAngleRad());
-    // aplica o offset de recentralização: outQuat = calibQuat * rawQuat
-    outQuat.copy(calibQuat).multiply(rawQuat);
-    neckPivot.quaternion.copy(outQuat);
-    document.getElementById('modeY').textContent = 'sensor do aparelho (sem trava, 360° livre)';
-  } else {
-    document.getElementById('modeY').textContent = 'aguardando sensor…';
+  if (opticalFlowLoopActive) {
+    const nowFlow = performance.now();
+    if (nowFlow - lastOpticalFlowTickTime >= OPTICAL_FLOW_MIN_INTERVAL_MS) {
+      lastOpticalFlowTickTime = nowFlow;
+      opticalFlowTick();
+    }
   }
 
-  eulerReadout.setFromQuaternion(neckPivot.quaternion, 'YXZ');
-  document.getElementById('y').textContent = THREE.MathUtils.radToDeg(eulerReadout.y).toFixed(1);
-  document.getElementById('p').textContent = THREE.MathUtils.radToDeg(eulerReadout.x).toFixed(1);
-  document.getElementById('r').textContent = THREE.MathUtils.radToDeg(eulerReadout.z).toFixed(1);
+  let displaySpeedRad;
+
+  if (hasGyroQuaternion) {
+    // Caminho principal: giroscópio bruto integrado A CADA FRAME (não
+    // depende de nenhum evento externo chegar a tempo), corrigido aos
+    // poucos pela orientação absoluta fundida (complementar). Isso é o
+    // que elimina o "trava no meio do giro": mesmo que a bússola/fusão
+    // atrase ou pare de mandar evento por um instante, o giroQuaternion
+    // já foi integrado no frame anterior e continua girando liso.
+    applyDisplayRemap(gyroQuaternion, _remappedGyro);
+    displayQuaternion.copy(calibInverseQuaternion).multiply(_remappedGyro);
+    // Suavização leve só pra tirar ruído de alta frequência do MEMS, sem
+    // atraso perceptível (o giroscópio já atualiza a ~60Hz+ por conta própria).
+    neckPivot.quaternion.slerp(displayQuaternion, 0.75);
+    displaySpeedRad = sensorAngularSpeed;
+
+    document.getElementById('modeY').textContent =
+      `giroscópio integrado + correção fundida${cameraActive ? ' · câmera em standby' : ''}`;
+
+    _hudEuler.setFromQuaternion(neckPivot.quaternion, 'YXZ');
+    document.getElementById('y').textContent = THREE.MathUtils.radToDeg(_hudEuler.y).toFixed(1);
+    document.getElementById('p').textContent = THREE.MathUtils.radToDeg(_hudEuler.x).toFixed(1);
+    document.getElementById('r').textContent = THREE.MathUtils.radToDeg(_hudEuler.z).toFixed(1);
+  } else {
+    // Contingência: sem orientação fundida (navegador/emulador limitado).
+    // Usa o combo antigo câmera+bússola+acelerômetro.
+    if (hasCompassYaw && cameraTrust < 0.4 && yawCompassOffset !== null) {
+      const compassEstimate = yawCompassRaw + yawCompassOffset;
+      let diff = compassEstimate - yaw;
+      diff = Math.atan2(Math.sin(diff), Math.cos(diff));
+      const pullStrength = THREE.MathUtils.lerp(0.06, 0.20, 1 - cameraTrust);
+      yaw += diff * pullStrength;
+      document.getElementById('modeY').textContent = cameraTrust < 0.05 ? 'bússola (contingência)' : 'câmera (contingência)';
+    }
+
+    const dtFrame = Math.min(0.05, (performance.now() - lastYawTickTime) / 1000);
+    const yawExtrapolated = yaw + yawVelocity * dtFrame * 0.4;
+
+    neckPivot.rotation.y += (yawExtrapolated - neckPivot.rotation.y) * 0.55;
+    neckPivot.rotation.x += (pitch - neckPivot.rotation.x) * 0.5;
+    neckPivot.rotation.z += (roll - neckPivot.rotation.z) * 0.5;
+    neckPivot.quaternion.setFromEuler(neckPivot.rotation);
+
+    displaySpeedRad = Math.abs(yawVelocity);
+
+    document.getElementById('p').textContent = THREE.MathUtils.radToDeg(pitch).toFixed(1);
+    document.getElementById('y').textContent = THREE.MathUtils.radToDeg(yaw).toFixed(1);
+    document.getElementById('r').textContent = THREE.MathUtils.radToDeg(roll).toFixed(1);
+  }
+
+  const speedDeg = Math.abs(THREE.MathUtils.radToDeg(displaySpeedRad));
+  const vignetteStrength = Math.min(0.55, speedDeg / 260);
+  document.getElementById('vignette').style.opacity = vignetteStrength.toFixed(2);
 
   if (stereoMode) {
     const w = innerWidth, h = innerHeight, halfW = w / 2;
